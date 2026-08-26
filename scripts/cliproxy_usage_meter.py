@@ -88,6 +88,7 @@ DEFAULT_SUB2API_PAGE_SIZE = 1000
 DEFAULT_SUB2API_BACKFILL_DAYS = 30
 MAX_SUB2API_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SUB2API_PAGES = 10_000
+IMPORTED_EVENT_SYNC_BATCH_SIZE = 500
 SUB2API_REQUEST_SOURCE = "sub2api"
 SUB2API_QUOTA_SOURCE = "sub2api_quota"
 SUB2API_ACCOUNT_SOURCE = "sub2api_account"
@@ -2409,6 +2410,40 @@ class UsageEvent:
     account_attempt: int = 1
 
 
+@dataclass(frozen=True)
+class _PreparedImportedEvent:
+    import_key: str
+    source: str
+    values: Mapping[str, Any]
+    observation_action: str
+    observation_values: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _ImportedEventState:
+    import_record_exists: bool
+    import_source: str | None
+    usage_event_id: int | None
+    usage: Mapping[str, Any] | None
+    observation: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _ImportedEventDecision:
+    prepared: _PreparedImportedEvent
+    status: str
+    values: Mapping[str, Any]
+    changed_columns: tuple[str, ...]
+    observation_changed: bool
+    usage_event_id: int | None
+
+    @property
+    def needs_write(self) -> bool:
+        return self.status in {"new", "changed"} or (
+            self.status == "retired" and self.observation_changed
+        )
+
+
 def _decode_jwt_claims_unverified(value: Any) -> Mapping[str, Any]:
     """Read non-secret identity metadata from a local JWT without verifying it.
 
@@ -3015,6 +3050,10 @@ class UsageRepository:
                       status_code=excluded.status_code,
                       call_count=excluded.call_count,
                       source=excluded.source
+                    WHERE api_response_observations.minute_ts IS NOT excluded.minute_ts
+                       OR api_response_observations.status_code IS NOT excluded.status_code
+                       OR api_response_observations.call_count IS NOT excluded.call_count
+                       OR api_response_observations.source IS NOT excluded.source
                     """,
                     RESPONSE_TIMELINE_SOURCES,
                 )
@@ -4791,22 +4830,14 @@ class UsageRepository:
         return values
 
     @staticmethod
-    def _upsert_api_response_observation_conn(
-        conn: sqlite3.Connection,
+    def _api_response_observation_target(
         observation_key: str,
         timestamp: Any,
         status_code: Any,
         call_count: Any,
         source: Any,
         account_attempt: Any = 1,
-    ) -> None:
-        """Persist eligible HTTP response metadata at minute precision.
-
-        Account-selection failures are retained in ``usage_events`` for
-        request/failure history, but they are not upstream API responses and
-        therefore must not affect the HTTP health timeline.
-        """
-
+    ) -> tuple[str, dict[str, Any] | None]:
         safe_source = safe_alias(source)
         safe_key = safe_text(observation_key, 512)
         normalized = normalize_optional_timestamp(timestamp)
@@ -4815,18 +4846,38 @@ class UsageRepository:
             or not safe_key
             or not normalized
         ):
-            return
+            return "skip", None
         if as_nonnegative_int(account_attempt) == 0:
-            conn.execute(
-                "DELETE FROM api_response_observations WHERE observation_key=?",
-                (safe_key,),
-            )
-            return
+            return "delete", {"observation_key": safe_key}
         parsed_status = as_nonnegative_int(status_code)
         if parsed_status is not None and not 100 <= parsed_status <= 599:
             parsed_status = None
         calls = max(as_nonnegative_int(call_count) or 1, 1)
-        conn.execute(
+        return "upsert", {
+            "observation_key": safe_key,
+            "minute_ts": f"{normalized[:16]}:00Z",
+            "status_code": parsed_status,
+            "call_count": calls,
+            "source": safe_source,
+        }
+
+    @staticmethod
+    def _write_api_response_observation_conn(
+        conn: sqlite3.Connection,
+        action: str,
+        values: Mapping[str, Any] | None,
+    ) -> int:
+        if action == "skip" or values is None:
+            return 0
+        if action == "delete":
+            cursor = conn.execute(
+                "DELETE FROM api_response_observations WHERE observation_key=?",
+                (values["observation_key"],),
+            )
+            return max(int(cursor.rowcount), 0)
+        if action != "upsert":
+            raise ValueError("invalid observation action")
+        cursor = conn.execute(
             """
             INSERT INTO api_response_observations (
               observation_key, minute_ts, status_code, call_count, source
@@ -4836,15 +4887,48 @@ class UsageRepository:
               status_code=excluded.status_code,
               call_count=excluded.call_count,
               source=excluded.source
+            WHERE api_response_observations.minute_ts IS NOT excluded.minute_ts
+               OR api_response_observations.status_code IS NOT excluded.status_code
+               OR api_response_observations.call_count IS NOT excluded.call_count
+               OR api_response_observations.source IS NOT excluded.source
             """,
             (
-                safe_key,
-                f"{normalized[:16]}:00Z",
-                parsed_status,
-                calls,
-                safe_source,
+                values["observation_key"],
+                values["minute_ts"],
+                values["status_code"],
+                values["call_count"],
+                values["source"],
             ),
         )
+        return max(int(cursor.rowcount), 0)
+
+    @classmethod
+    def _upsert_api_response_observation_conn(
+        cls,
+        conn: sqlite3.Connection,
+        observation_key: str,
+        timestamp: Any,
+        status_code: Any,
+        call_count: Any,
+        source: Any,
+        account_attempt: Any = 1,
+    ) -> int:
+        """Persist eligible HTTP response metadata at minute precision.
+
+        Account-selection failures are retained in ``usage_events`` for
+        request/failure history, but they are not upstream API responses and
+        therefore must not affect the HTTP health timeline.
+        """
+
+        action, values = cls._api_response_observation_target(
+            observation_key,
+            timestamp,
+            status_code,
+            call_count,
+            source,
+            account_attempt,
+        )
+        return cls._write_api_response_observation_conn(conn, action, values)
 
     @staticmethod
     def _subscription_detail_allowed_conn(
@@ -5058,84 +5142,396 @@ class UsageRepository:
             )
         return True
 
+    @staticmethod
+    def _empty_import_sync_stats() -> dict[str, int]:
+        return {
+            "scanned": 0,
+            "new": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "retired": 0,
+            "source_conflict": 0,
+            "write_transactions": 0,
+            "usage_updates": 0,
+            "observation_updates": 0,
+        }
+
+    @staticmethod
+    def _imported_event_states_conn(
+        conn: sqlite3.Connection,
+        batch: Sequence[_PreparedImportedEvent],
+    ) -> dict[str, _ImportedEventState]:
+        if not batch:
+            return {}
+        event_columns = tuple(batch[0].values)
+        requested_values = ",".join("(?)" for _ in batch)
+        event_selection = ",\n".join(
+            f'events."{column}" AS "event_{column}"' for column in event_columns
+        )
+        rows = conn.execute(
+            f"""
+            WITH requested(import_key) AS (VALUES {requested_values})
+            SELECT requested.import_key AS requested_key,
+                   imports.import_key IS NOT NULL AS import_record_exists,
+                   imports.source AS import_source,
+                   imports.usage_event_id AS usage_event_id,
+                   events.id AS usage_row_id,
+                   {event_selection},
+                   observations.observation_key AS observation_key,
+                   observations.minute_ts AS observation_minute_ts,
+                   observations.status_code AS observation_status_code,
+                   observations.call_count AS observation_call_count,
+                   observations.source AS observation_source
+              FROM requested
+              LEFT JOIN local_import_records imports
+                ON imports.import_key=requested.import_key
+              LEFT JOIN usage_events events
+                ON events.id=imports.usage_event_id
+              LEFT JOIN api_response_observations observations
+                ON observations.observation_key='import:' || requested.import_key
+            """,
+            tuple(item.import_key for item in batch),
+        ).fetchall()
+        states: dict[str, _ImportedEventState] = {}
+        for row in rows:
+            usage = (
+                {column: row[f"event_{column}"] for column in event_columns}
+                if row["usage_row_id"] is not None
+                else None
+            )
+            observation = (
+                {
+                    "observation_key": row["observation_key"],
+                    "minute_ts": row["observation_minute_ts"],
+                    "status_code": row["observation_status_code"],
+                    "call_count": row["observation_call_count"],
+                    "source": row["observation_source"],
+                }
+                if row["observation_key"] is not None
+                else None
+            )
+            states[str(row["requested_key"])] = _ImportedEventState(
+                import_record_exists=bool(row["import_record_exists"]),
+                import_source=row["import_source"],
+                usage_event_id=(
+                    int(row["usage_event_id"])
+                    if row["usage_event_id"] is not None
+                    else None
+                ),
+                usage=usage,
+                observation=observation,
+            )
+        return states
+
+    @staticmethod
+    def _subscription_detail_allowed_keys_conn(
+        conn: sqlite3.Connection,
+        identity_keys: Iterable[Any],
+    ) -> set[str]:
+        keys = sorted(
+            {
+                key
+                for value in identity_keys
+                if (key := canonical_subscription_key(value))
+            }
+        )
+        if not keys:
+            return set()
+        placeholders = ",".join("?" for _ in keys)
+        tombstones = {
+            str(row["identity_key"])
+            for row in conn.execute(
+                f"""SELECT identity_key FROM retired_subscription_tombstones
+                      WHERE identity_key IN ({placeholders})""",
+                keys,
+            ).fetchall()
+        }
+        registry = {
+            str(row["identity_key"]): str(row["state"])
+            for row in conn.execute(
+                f"""SELECT identity_key, state FROM active_subscription_registry
+                      WHERE identity_key IN ({placeholders})""",
+                keys,
+            ).fetchall()
+        }
+        inventory = conn.execute(
+            "SELECT initialized FROM subscription_inventory_state WHERE id=1"
+        ).fetchone()
+        initialized = bool(inventory and inventory["initialized"])
+        return {
+            key
+            for key in keys
+            if key not in tombstones
+            and (
+                registry.get(key) == "active"
+                or (key not in registry and not initialized)
+            )
+        }
+
+    @staticmethod
+    def _observation_target_changed(
+        prepared: _PreparedImportedEvent,
+        existing: Mapping[str, Any] | None,
+    ) -> bool:
+        if prepared.observation_action == "skip":
+            return False
+        if prepared.observation_action == "delete":
+            return existing is not None
+        target = prepared.observation_values
+        if target is None or existing is None:
+            return True
+        return any(
+            existing.get(column) != target.get(column)
+            for column in ("minute_ts", "status_code", "call_count", "source")
+        )
+
+    @staticmethod
+    def _classify_imported_event(
+        prepared: _PreparedImportedEvent,
+        state: _ImportedEventState,
+        allowed_identity_keys: set[str],
+        restore_retired_observation: bool = False,
+    ) -> _ImportedEventDecision:
+        values = dict(prepared.values)
+        if state.import_record_exists:
+            if state.import_source != prepared.source:
+                return _ImportedEventDecision(
+                    prepared, "source_conflict", values, (), False, None
+                )
+            existing = state.usage
+            if state.usage_event_id is None or existing is None:
+                # Privacy retirement is a durable dedupe tombstone.  Do not
+                # recreate account detail.  Cockpit's versioned legacy replay
+                # can explicitly restore its identity-free response ledger;
+                # normal overlap imports, including Sub2API, cannot.
+                observation_changed = bool(
+                    restore_retired_observation
+                    and UsageRepository._observation_target_changed(
+                        prepared,
+                        state.observation,
+                    )
+                )
+                return _ImportedEventDecision(
+                    prepared,
+                    "retired",
+                    values,
+                    (),
+                    observation_changed,
+                    None,
+                )
+            identity_key_value = canonical_subscription_key(values["identity_key"])
+            if identity_key_value not in allowed_identity_keys:
+                # A suspect or retired key must not downgrade a still-live
+                # historical row during an external repricing scan.
+                values["identity_key"] = existing["identity_key"]
+            changed_columns = tuple(
+                column
+                for column, value in values.items()
+                if existing[column] != value
+            )
+            observation_changed = UsageRepository._observation_target_changed(
+                prepared,
+                state.observation,
+            )
+            status = "changed" if changed_columns or observation_changed else "unchanged"
+            return _ImportedEventDecision(
+                prepared,
+                status,
+                values,
+                changed_columns,
+                observation_changed,
+                state.usage_event_id,
+            )
+
+        identity_key_value = canonical_subscription_key(values["identity_key"])
+        if identity_key_value not in allowed_identity_keys:
+            values["identity_key"] = "unknown"
+        return _ImportedEventDecision(
+            prepared,
+            "new",
+            values,
+            tuple(values),
+            UsageRepository._observation_target_changed(
+                prepared,
+                state.observation,
+            ),
+            None,
+        )
+
+    def _classify_imported_event_batch_conn(
+        self,
+        conn: sqlite3.Connection,
+        batch: Sequence[_PreparedImportedEvent],
+        restore_retired_observations: bool = False,
+    ) -> list[_ImportedEventDecision]:
+        states = self._imported_event_states_conn(conn, batch)
+        allowed = self._subscription_detail_allowed_keys_conn(
+            conn,
+            (item.values.get("identity_key") for item in batch),
+        )
+        return [
+            self._classify_imported_event(
+                item,
+                states[item.import_key],
+                allowed,
+                restore_retired_observations,
+            )
+            for item in batch
+        ]
+
+    def _write_imported_event_batch_conn(
+        self,
+        conn: sqlite3.Connection,
+        classified: Sequence[_ImportedEventDecision],
+    ) -> dict[str, int]:
+        stats = self._empty_import_sync_stats()
+        stats["scanned"] = len(classified)
+        for decision in classified:
+            prepared = decision.prepared
+            stats[decision.status] += 1
+            if decision.status == "new":
+                values = decision.values
+                columns = list(values)
+                placeholders = ",".join("?" for _ in columns)
+                cursor = conn.execute(
+                    f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
+                    tuple(values[column] for column in columns),
+                )
+                conn.execute(
+                    """INSERT INTO local_import_records
+                       (import_key, source, usage_event_id, imported_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        prepared.import_key,
+                        prepared.source,
+                        int(cursor.lastrowid),
+                        utc_now(),
+                    ),
+                )
+                stats["observation_updates"] += self._write_api_response_observation_conn(
+                    conn,
+                    prepared.observation_action,
+                    prepared.observation_values,
+                )
+                continue
+            if decision.status == "retired" and decision.observation_changed:
+                stats["observation_updates"] += self._write_api_response_observation_conn(
+                    conn,
+                    prepared.observation_action,
+                    prepared.observation_values,
+                )
+                continue
+            if decision.status != "changed":
+                continue
+            if decision.changed_columns:
+                if decision.usage_event_id is None:
+                    raise ValueError("missing imported usage event")
+                assignments = ", ".join(
+                    f"{column}=?" for column in decision.changed_columns
+                )
+                cursor = conn.execute(
+                    f"UPDATE usage_events SET {assignments} WHERE id=?",
+                    (
+                        *[
+                            decision.values[column]
+                            for column in decision.changed_columns
+                        ],
+                        decision.usage_event_id,
+                    ),
+                )
+                stats["usage_updates"] += max(int(cursor.rowcount), 0)
+            if decision.observation_changed:
+                stats["observation_updates"] += self._write_api_response_observation_conn(
+                    conn,
+                    prepared.observation_action,
+                    prepared.observation_values,
+                )
+        return stats
+
+    def sync_imported_events(
+        self,
+        events: Sequence[tuple[UsageEvent, str]],
+        source: str,
+        batch_size: int = IMPORTED_EVENT_SYNC_BATCH_SIZE,
+        restore_retired_observations: bool = False,
+    ) -> dict[str, int]:
+        """Synchronize external events with read-first, bounded write batches."""
+
+        safe_source = safe_alias(source)
+        if not safe_source:
+            raise ValueError("invalid import identity")
+        prepared_events: list[_PreparedImportedEvent] = []
+        seen_keys: set[str] = set()
+        for event, import_key in events:
+            safe_key = safe_text(import_key, 300)
+            if not safe_key or safe_key in seen_keys:
+                raise ValueError("invalid import identity")
+            seen_keys.add(safe_key)
+            event.source = safe_source
+            self._validate_event_costs(event)
+            values = self._minimized_event_values(event)
+            observation_action, observation_values = self._api_response_observation_target(
+                f"import:{safe_key}",
+                values["ts"],
+                values["status_code"],
+                values["call_count"],
+                safe_source,
+                values["account_attempt"],
+            )
+            prepared_events.append(
+                _PreparedImportedEvent(
+                    import_key=safe_key,
+                    source=safe_source,
+                    values=values,
+                    observation_action=observation_action,
+                    observation_values=observation_values,
+                )
+            )
+
+        stats = self._empty_import_sync_stats()
+        bounded_batch_size = max(1, min(int(batch_size), IMPORTED_EVENT_SYNC_BATCH_SIZE))
+        for offset in range(0, len(prepared_events), bounded_batch_size):
+            batch = prepared_events[offset : offset + bounded_batch_size]
+            with self.connect() as conn:
+                classified = self._classify_imported_event_batch_conn(
+                    conn,
+                    batch,
+                    restore_retired_observations,
+                )
+            if not any(decision.needs_write for decision in classified):
+                batch_stats = self._empty_import_sync_stats()
+                batch_stats["scanned"] = len(classified)
+                for decision in classified:
+                    batch_stats[decision.status] += 1
+            else:
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    classified = self._classify_imported_event_batch_conn(
+                        conn,
+                        batch,
+                        restore_retired_observations,
+                    )
+                    batch_stats = self._write_imported_event_batch_conn(conn, classified)
+                batch_stats["write_transactions"] = 1
+            for key, value in batch_stats.items():
+                stats[key] += value
+        return stats
+
     def sync_imported_event(
         self,
         event: UsageEvent,
         import_key: str,
         source: str,
+        restore_retired_observation: bool = False,
     ) -> bool:
-        """Insert or safely refresh one externally priced imported event.
+        """Synchronize one external event through the bounded batch path."""
 
-        ``True`` means a new usage row was inserted.  An existing live row is
-        updated in place and returns ``False``; a privacy-retired import record
-        whose ``usage_event_id`` is NULL is never re-created.
-        """
-
-        safe_key = safe_text(import_key, 300)
-        safe_source = safe_alias(source)
-        if not safe_key or not safe_source:
-            raise ValueError("invalid import identity")
-        event.source = safe_source
-        self._validate_event_costs(event)
-        values = self._minimized_event_values(event)
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            imported = conn.execute(
-                """SELECT source, usage_event_id FROM local_import_records
-                     WHERE import_key=?""",
-                (safe_key,),
-            ).fetchone()
-            if imported is not None and imported["source"] != safe_source:
-                return False
-            self._upsert_api_response_observation_conn(
-                conn,
-                f"import:{safe_key}",
-                event.ts,
-                event.status_code,
-                event.call_count,
-                safe_source,
-                values["account_attempt"],
-            )
-            canonical_key = canonical_subscription_key(event.identity_key)
-            identity_allowed = bool(
-                canonical_key
-                and self._subscription_detail_allowed_conn(conn, canonical_key)
-            )
-            if imported is not None:
-                if imported["usage_event_id"] is None:
-                    return False
-                existing = conn.execute(
-                    "SELECT identity_key FROM usage_events WHERE id=?",
-                    (imported["usage_event_id"],),
-                ).fetchone()
-                if existing is None:
-                    return False
-                if not identity_allowed:
-                    # A suspect or retired key must not downgrade a still-live
-                    # historical row during a Cockpit repricing scan.
-                    values["identity_key"] = existing["identity_key"]
-                assignments = ", ".join(f"{column}=?" for column in values)
-                conn.execute(
-                    f"UPDATE usage_events SET {assignments} WHERE id=?",
-                    (*[values[column] for column in values], imported["usage_event_id"]),
-                )
-                return False
-
-            if not identity_allowed:
-                values["identity_key"] = "unknown"
-            columns = list(values)
-            placeholders = ",".join("?" for _ in columns)
-            cursor = conn.execute(
-                f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
-                tuple(values[column] for column in columns),
-            )
-            conn.execute(
-                """INSERT INTO local_import_records
-                   (import_key, source, usage_event_id, imported_at)
-                   VALUES (?, ?, ?, ?)""",
-                (safe_key, safe_source, int(cursor.lastrowid), utc_now()),
-            )
-        return True
+        result = self.sync_imported_events(
+            [(event, import_key)],
+            source,
+            restore_retired_observations=restore_retired_observation,
+        )
+        return bool(result["new"])
 
     def import_status(self, source: str = "codex_app_local") -> dict[str, Any]:
         with self.connect() as conn:
@@ -8029,6 +8425,7 @@ class CockpitToolsImporter:
                     event,
                     import_key,
                     COCKPIT_TOOLS_REQUEST_SOURCE,
+                    restore_retired_observation=response_backfill,
                 ):
                     imported += 1
         try:
@@ -8127,6 +8524,13 @@ class Sub2APIImporter:
         self._last_error_type: str | None = None
         self._last_imported = 0
         self._last_scanned = 0
+        self._last_changed = 0
+        self._last_unchanged = 0
+        self._last_retired = 0
+        self._last_source_conflict = 0
+        self._last_write_transactions = 0
+        self._last_usage_updates = 0
+        self._last_observation_updates = 0
         self._last_account_count = 0
         self._last_quota_rows = 0
         self._api_available = False
@@ -8184,6 +8588,14 @@ class Sub2APIImporter:
             "last_success_at": self._last_success_at,
             "last_error_type": self._last_error_type,
             "last_imported": self._last_imported,
+            "last_new": self._last_imported,
+            "last_changed": self._last_changed,
+            "last_unchanged": self._last_unchanged,
+            "last_retired": self._last_retired,
+            "last_source_conflict": self._last_source_conflict,
+            "last_write_transactions": self._last_write_transactions,
+            "last_usage_updates": self._last_usage_updates,
+            "last_observation_updates": self._last_observation_updates,
             "last_scanned": self._last_scanned,
             "account_count": self._last_account_count,
             "last_quota_rows": self._last_quota_rows,
@@ -8233,10 +8645,31 @@ class Sub2APIImporter:
                 self._last_error_type = None
                 self._last_imported = result["imported"]
                 self._last_scanned = result["scanned"]
+                self._last_changed = result["changed"]
+                self._last_unchanged = result["unchanged"]
+                self._last_retired = result["retired"]
+                self._last_source_conflict = result["source_conflict"]
+                self._last_write_transactions = result["write_transactions"]
+                self._last_usage_updates = result["usage_updates"]
+                self._last_observation_updates = result["observation_updates"]
                 self._last_account_count = result["accounts"]
                 self._last_quota_rows = result["quota_rows"]
                 self._api_available = True
                 self._backoff = self.poll_seconds
+                LOG.info(
+                    "Sub2API import scanned=%d new=%d changed=%d unchanged=%d "
+                    "retired=%d source_conflict=%d write_transactions=%d "
+                    "usage_updates=%d observation_updates=%d",
+                    result["scanned"],
+                    result["new"],
+                    result["changed"],
+                    result["unchanged"],
+                    result["retired"],
+                    result["source_conflict"],
+                    result["write_transactions"],
+                    result["usage_updates"],
+                    result["observation_updates"],
+                )
             except Sub2APIHTTPError as exc:
                 self._last_poll_at = utc_now()
                 self._last_status = exc.status
@@ -8678,27 +9111,38 @@ class Sub2APIImporter:
                 "exact_total": "true",
             },
         )
-        imported = 0
+        converted_events: list[tuple[UsageEvent, str]] = []
         for record in usage_records:
             converted = self._event_from_record(record)
             if converted is None:
                 continue
-            event, import_key = converted
-            if self.repo.sync_imported_event(
-                event,
-                import_key,
-                SUB2API_REQUEST_SOURCE,
-            ):
-                imported += 1
+            converted_events.append(converted)
+        sync_result = self.repo.sync_imported_events(
+            converted_events,
+            SUB2API_REQUEST_SOURCE,
+        )
         self.repo.save_remote_import_state(
             SUB2API_REQUEST_SOURCE,
             scan_started,
         )
         return {
-            "imported": imported,
+            "imported": sync_result["new"],
             "scanned": len(usage_records),
             "accounts": len(accounts),
             "quota_rows": quota_rows,
+            **{
+                key: sync_result[key]
+                for key in (
+                    "new",
+                    "changed",
+                    "unchanged",
+                    "retired",
+                    "source_conflict",
+                    "write_transactions",
+                    "usage_updates",
+                    "observation_updates",
+                )
+            },
         }
 
 
@@ -11183,6 +11627,14 @@ class MeterHTTPServer(ThreadingHTTPServer):
             "last_success_at": None,
             "last_error_type": None,
             "last_imported": 0,
+            "last_new": 0,
+            "last_changed": 0,
+            "last_unchanged": 0,
+            "last_retired": 0,
+            "last_source_conflict": 0,
+            "last_write_transactions": 0,
+            "last_usage_updates": 0,
+            "last_observation_updates": 0,
             "last_scanned": 0,
             "account_count": 0,
             "last_quota_rows": 0,
