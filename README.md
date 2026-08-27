@@ -485,7 +485,7 @@ be set with `--set-price MODEL_PATTERN INPUT_PER_M OUTPUT_PER_M` plus
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+pytest -q
 ```
 
 The suite covers Responses and Chat Completions usage normalization, streaming
