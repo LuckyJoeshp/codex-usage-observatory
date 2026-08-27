@@ -1783,7 +1783,7 @@ class UsageMeterMVPTest(unittest.TestCase):
         status, headers, page = self.request("GET", "/usage", None, alias=None)
         self.assertEqual(status, 200)
         self.assertEqual(dict((key.lower(), value) for key, value in headers)["cache-control"], "no-store")
-        self.assertIn(b"Usage Observatory", page)
+        self.assertIn(b"Codex Usage Observatory", page)
         self.assertIn("Token 消费总览".encode(), page)
         self.assertIn("近 7 天趋势".encode(), page)
         self.assertIn("订阅额度雷达".encode(), page)

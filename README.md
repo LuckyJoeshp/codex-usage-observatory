@@ -1,18 +1,20 @@
-# cliproxyapi-usage-meter
+# Codex Usage Observatory
 
-[![Public repository](https://img.shields.io/badge/repository-public-2ea44f?style=flat-square)](https://github.com/LuckyJoeshp/cliproxyapi-usage-meter)
+[![Public repository](https://img.shields.io/badge/repository-public-2ea44f?style=flat-square)](https://github.com/LuckyJoeshp/codex-usage-observatory)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-37%20passing-2ea44f?style=flat-square)](tests/)
 [![License](https://img.shields.io/badge/license-MIT-yellow?style=flat-square)](LICENSE)
 
-**A local, token-safe Usage Observatory for CLIProxyAPI.**
+**Local-first usage, cost, quota, and account observability for Codex.**
 
-See every request, split input/cache/output tokens, estimate API-equivalent
-cost, observe quota resets, and understand account-pool retries from one
-private-by-default dashboard. It runs as a transparent sidecar: clients can
-send traffic through `8327`, while the optional read-only queue collector also
-captures clients that still use `8317`, and the Sub2API importer observes
-`codex-s2a` traffic sent directly to a local Sub2API instance.
+Codex Usage Observatory brings request usage, local session metadata, account
+status, and provider-reported quota windows into one private-by-default
+dashboard. It normalizes non-cached input, cache, output, and reasoning tokens,
+then estimates API-equivalent cost without storing prompts or credentials.
+
+Run it as a read-only collector for Cockpit Tools, Sub2API, and local Codex
+sessions, or place its optional transparent proxy in front of any
+OpenAI-compatible endpoint. CLIProxyAPI support remains available as one
+optional adapter; **CLIProxyAPI is not required.**
 
 ![Usage Observatory demo — real aggregates with account IDs masked](assets/usage-dashboard-demo.png)
 
@@ -23,19 +25,29 @@ replaced with neutral demo labels._
 
 > This is an observability tool, not a billing API. It cannot read an official
 > ChatGPT subscription balance. Dollar figures are API-price equivalents, and
-> quota figures are observed/provider-reported windows—not invoices or
+> quota figures are observed/provider-reported windows, not invoices or
 > guaranteed remaining balances.
-
-```text
-client -> 127.0.0.1:8327/v1/... -> usage meter -> 127.0.0.1:8317/v1/...
-```
 
 ## Why use it
 
-CLIProxyAPI can fan one logical request across several subscription accounts.
-That makes a raw proxy log difficult to answer: **what did I actually consume,
-which account handled it, how much was cached, and why did the account pool
-retry?** This sidecar keeps those questions separate and auditable in SQLite.
+Codex usage can be split across local JSONL metadata, proxy responses, request
+databases, and provider management APIs. Each source answers only part of the
+question: **what was consumed, which account handled it, how much was cached,
+what did it cost at API rates, and when does quota reset?** The observatory
+normalizes those observations into one local SQLite model and dashboard.
+
+## Supported sources
+
+| Source | Collection mode | Required? |
+| --- | --- | --- |
+| Local Codex sessions | Read-only `token_count` and rate-limit metadata from discovered Codex homes | No |
+| Cockpit Tools | Read-only request-log, account, pricing, and quota import | No |
+| Sub2API | Authenticated loopback import from admin account and usage endpoints | No |
+| OpenAI-compatible APIs | Optional transparent proxy for Responses and Chat Completions traffic | No |
+| CLIProxyAPI | Optional usage-queue, account, quota, and routing-guard integration | No |
+
+Collectors can be enabled independently. If the same request is visible through
+more than one path, enable only one of those paths to avoid double counting.
 
 ## What it gives you
 
@@ -45,27 +57,47 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Cost estimation | Collector-frozen per-request prices or official OpenAI short/long-context prices, split by token type |
 | Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
 | Quota visibility | Read-only windows classified by duration (5-hour/week/month), reset times, provider gate state, cooldowns, and observed floors |
-| Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, read-only Cockpit Tools import, and authenticated loopback Sub2API import |
+| Collection paths | Local Codex metadata, read-only Cockpit Tools, loopback Sub2API, transparent proxy, and optional CLIProxyAPI management integration |
 | Dashboard | Inline, dependency-free `/usage` HTML with a per-minute HTTP 200/non-200 line timeline, token trend, account, model, and recent-call views |
 | Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
 
 ## Quick start
 
 ```bash
-git clone https://github.com/LuckyJoeshp/cliproxyapi-usage-meter.git
-cd cliproxyapi-usage-meter
+git clone https://github.com/LuckyJoeshp/codex-usage-observatory.git
+cd codex-usage-observatory
 
-# Keep CLIProxyAPI on 8317; point only the clients you want observed at 8327.
-PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
-  scripts/start_cliproxy_usage_meter.sh
+# Collector-only mode: no CLIProxyAPI service or management key required.
+umask 077
+python3 scripts/codex_usage_observatory.py --serve --no-usage-queue
 ```
 
 Open <http://127.0.0.1:8327/usage>.
 
-The launcher applies an owner-only `umask`; on POSIX the meter also attempts to
-repair existing SQLite, WAL, and SHM permissions to `0600` when opened
-directly. Runtime databases remain local data and are intentionally not part
-of the repository (Windows relies on ACLs).
+Collector-only mode auto-discovers available local Codex and Cockpit Tools data.
+The Sub2API collector stays idle until an admin key is configured. Missing
+sources are treated as unavailable, not as startup failures.
+
+To observe traffic inline, set any OpenAI-compatible upstream and point the
+selected client's base URL at `http://127.0.0.1:8327/v1`:
+
+```bash
+umask 077
+UPSTREAM=http://127.0.0.1:8080 \
+  python3 scripts/codex_usage_observatory.py --serve --no-usage-queue
+```
+
+On POSIX the meter attempts to keep SQLite, WAL, and SHM files at `0600` even
+when opened directly. Runtime databases remain local data and are intentionally
+not part of the repository (Windows relies on ACLs).
+
+`scripts/codex_usage_observatory.py` is the canonical CLI. The original
+`cliproxy_usage_meter.py` entry point and `CLIPROXY_*` environment variables are
+kept as compatibility interfaces for existing installations.
+
+## Collection details
+
+### Local Codex session metadata
 
 The dashboard also monitors direct ChatGPT App Codex sessions when local Codex
 JSONL history is available. By default it follows the current account in
@@ -87,11 +119,9 @@ single-home matching is desired. The `/usage` manual import form is exposed in
 that fixed-alias mode only. Dollar values are API-equivalent estimates, not Pro
 subscription billing.
 
-### Import direct `codex-s2a` traffic from Sub2API
+### Sub2API
 
-Requests sent by `codex-s2a` directly to Sub2API on `127.0.0.1:8080` never pass
-through the `8327` proxy or CLIProxyAPI queue. The default-on Sub2API importer
-therefore reads the paginated management endpoints
+The default-on Sub2API importer reads the paginated management endpoints
 `GET /api/v1/admin/accounts` and `GET /api/v1/admin/usage`. It stays idle until
 an admin API key is configured.
 
@@ -102,8 +132,7 @@ owner-only file outside this checkout. Do not use a normal client API key:
 chmod 600 /path/to/sub2api-admin.key
 SUB2API_BASE_URL=http://127.0.0.1:8080 \
 SUB2API_ADMIN_KEY_FILE=/path/to/sub2api-admin.key \
-  PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
-  scripts/start_cliproxy_usage_meter.sh
+  python3 scripts/codex_usage_observatory.py --serve --no-usage-queue
 ```
 
 The admin key is highly privileged, so the importer accepts only loopback
@@ -128,7 +157,7 @@ shown on `/usage` and `/healthz`.
 > the transparent proxy event and Sub2API usage row are two independent
 > observations of one call.
 
-### Migrate traffic to Cockpit Tools
+### Cockpit Tools
 
 The Cockpit Tools collector is enabled by default. It opens Cockpit's request
 log database read-only and imports `request_logs` rows into the same dashboard
@@ -167,8 +196,8 @@ messages are never copied out of Cockpit's cache or persisted by the meter. A
 later successful re-login that restores the credential can reactivate the
 account. Missing or malformed inventory sources remain fail-closed.
 
-For migration, point request traffic directly at Cockpit Tools and keep this
-meter running only to import Cockpit data and serve
+For collector-only use, point request traffic directly at Cockpit Tools and
+keep the observatory running to import Cockpit data and serve
 <http://127.0.0.1:8327/usage>. Tune the importer with
 `COCKPIT_TOOLS_USAGE_POLL_SECONDS` or
 `--cockpit-tools-poll-seconds SECONDS`, or disable it with
@@ -188,6 +217,11 @@ does not authorize deletion from that partial view.
 > enabled, the meter sees both the proxied request and Cockpit's log row. Route
 > clients directly to Cockpit, or add `--no-cockpit-tools-import` when using
 > `8327` as that proxy path.
+
+## Companion tools
+
+The dashboard and its collectors do not require the helpers below. They remain
+available for existing CLIProxyAPI and Cockpit Tools workflows.
 
 ### Incremental CLIProxyAPI → Cockpit account migration
 
@@ -366,7 +400,7 @@ If Chrome already has the local CLIProxyAPI management page open,
 `scripts/start_cliproxy_usage_meter_from_chrome.py` can pass its key in memory
 without writing or printing it.
 
-### Team/workspace identity
+## Identity and privacy
 
 A Team workspace's `chatgpt_account_id` identifies the workspace, not a unique
 member. The meter reads the email only from structured auth JSON or JWT claims;
@@ -412,8 +446,9 @@ inventory can reactivate it. Dynamic `/usage` and `/healthz` responses use
 
 ## Safety boundary
 
-- It does not modify, restart or replace CLIProxyAPI, port `8317`, Codex
-  config, shell aliases or existing client base URLs.
+- Read-only collectors do not modify or restart Codex, Cockpit Tools, Sub2API,
+  CLIProxyAPI, shell aliases, or existing client base URLs. Traffic changes
+  only when a client is explicitly pointed at the optional transparent proxy.
 - It listens on loopback by default. Do not expose it publicly without adding
   an authentication boundary of your own.
 - Authorization, API keys, OAuth tokens and management keys are never printed
@@ -433,13 +468,13 @@ inventory can reactivate it. Dynamic `/usage` and `/healthz` responses use
 ```bash
 PYTHON_BIN="${QLAB_PYTHON_BIN:-python3}"
 
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --summary today
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --summary all --json
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --by-account 7d
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --by-model 7d
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --quota-summary 30d
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --list-prices
-"$PYTHON_BIN" scripts/cliproxy_usage_meter.py --sync-official-prices
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --summary today
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --summary all --json
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --by-account 7d
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --by-model 7d
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --quota-summary 30d
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --list-prices
+"$PYTHON_BIN" scripts/codex_usage_observatory.py --sync-official-prices
 ```
 
 Official-price sync accepts only the documented OpenAI pricing hosts and
@@ -454,11 +489,13 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 The suite covers Responses and Chat Completions usage normalization, streaming
-byte transparency, error redaction, account mapping, usage-queue polling,
-quota/reset logic, official-price parsing, dashboard rendering and all CLI
-queries. It never contacts a real `8317` service.
+byte transparency, error redaction, account mapping, source importers,
+usage-queue polling, quota/reset logic, official-price parsing, dashboard
+rendering and all CLI queries. It uses synthetic fixtures and does not contact
+configured live services.
 
-Detailed design and the original requirements are in
+The original CLIProxyAPI-era design and requirements are retained for historical
+context in
 [`docs/cliproxy_usage_meter.md`](docs/cliproxy_usage_meter.md) and
 [`docs/cliproxy_usage_meter_requirements.md`](docs/cliproxy_usage_meter_requirements.md).
 

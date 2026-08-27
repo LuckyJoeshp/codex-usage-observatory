@@ -7616,7 +7616,7 @@ def fetch_official_pricing_html(url: str = OFFICIAL_PRICING_URL, timeout: float 
         url,
         headers={
             "Accept": "text/html,application/xhtml+xml",
-            "User-Agent": "cliproxy-usage-meter-official-price-sync/1",
+            "User-Agent": "codex-usage-observatory-official-price-sync/1",
         },
         method="GET",
     )
@@ -11438,7 +11438,7 @@ def dashboard_html(
     generated = datetime.now().astimezone().isoformat(timespec="seconds")
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30"><title>Usage Observatory</title>
+<meta http-equiv="refresh" content="30"><title>Codex Usage Observatory</title>
 <script>(()=>{{try{{const t=localStorage.getItem('cliproxy-usage-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}}catch(e){{}}}})()</script>
 <style>
 :root{{--paper:#fff4dd;--ink:#26201a;--ink-2:#5c5347;--ink-3:#877b6b;--card:#fffdf7;--sun:#ffd84d;--rose:#ffb9cc;--sky:#a5dcff;--mint:#a8edc4;--orange:#ff6b3d;--lavender:#cabdff;--cream:#f1e3c4;--watch:#fff0bd;--shadow-ink:#26201a;--dot:rgba(38,32,26,.08);--on-color:#26201a;--border:2px solid var(--ink);--shadow:5px 5px 0 var(--shadow-ink);--shadow-sm:3px 3px 0 var(--shadow-ink);--radius:14px;--font-display:"Arial Rounded MT Bold",ui-rounded,system-ui,-apple-system,sans-serif;--font-body:system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:ui-monospace,"SF Mono",Menlo,monospace}}
@@ -11457,7 +11457,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 .account-head i.confirmed{{background:var(--rose)}}.account-head i.reported{{background:var(--sun)}}.account-head i.available{{background:var(--mint)}}
 {RESPONSE_TIMELINE_CSS}
 </style></head><body><main>
-<header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
+<header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">CU</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Codex Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 	<section class="hero-grid">{hero_metrics}</section>
 	{codex_notice}
 	{cockpit_notice}
@@ -11476,7 +11476,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><p class="table-note">这是历史完成记录（时间精确到秒）；账号进入冷却不会删除冷却前的成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-	<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>Sub2API <b>{html.escape(sub2api_strip_text)}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+	<div class="system-strip"><span>CLIProxyAPI queue <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>Sub2API <b>{html.escape(sub2api_strip_text)}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script><script>{RESPONSE_TIMELINE_SCRIPT}</script></body></html>"""
 
@@ -11672,7 +11672,7 @@ class MeterHTTPServer(ThreadingHTTPServer):
 
 class UsageMeterHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "cliproxy-usage-meter/0.1"
+    server_version = "codex-usage-observatory/0.1"
 
     @property
     def meter_server(self) -> MeterHTTPServer:
@@ -12375,7 +12375,9 @@ def print_rows(rows: Sequence[Mapping[str, Any]], json_output: bool = False) -> 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local token-safe usage meter for cliproxyapi")
+    parser = argparse.ArgumentParser(
+        description="Local-first Codex usage, cost, and quota observatory"
+    )
     parser.add_argument(
         "--db", default=os.environ.get("CLIPROXY_USAGE_DB", str(DEFAULT_DB)), help="SQLite database path"
     )
