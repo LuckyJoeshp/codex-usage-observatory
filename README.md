@@ -119,6 +119,12 @@ single-home matching is desired. The `/usage` manual import form is exposed in
 that fixed-alias mode only. Dollar values are API-equivalent estimates, not Pro
 subscription billing.
 
+Independently signed-in local members contribute to the active-account union,
+including when Cockpit owns the proxy account inventory. Their email remains
+available in memory after provider refreshes, and new usage and quota snapshots
+retain that member's identity. Switching accounts still establishes a fresh
+collection boundary; removing a configured home removes its contribution.
+
 ### Sub2API
 
 The default-on Sub2API importer reads the paginated management endpoints

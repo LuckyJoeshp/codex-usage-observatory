@@ -2195,6 +2195,8 @@ class UsageMeterMVPTest(unittest.TestCase):
         )
 
     def test_dynamic_local_import_baselines_and_follows_account_switches(self) -> None:
+        managed_key = subscription_key("managed-pool-fixture")
+        self.sidecar.repo.reconcile_subscription_inventory({managed_key})
         app_home = self.temp_path / "dynamic-codex"
         sessions = app_home / "sessions"
         sessions.mkdir(parents=True)
@@ -2247,9 +2249,39 @@ class UsageMeterMVPTest(unittest.TestCase):
                 )
                 + "\n"
             )
+        # A provider can finish a stale inventory snapshot during startup.
+        # Keep the unread event until the next complete union admits it.
+        local_keys = resolver.active_subscription_keys(force_refresh=True)
+        self.assertEqual(len(local_keys), 1)
+        with self.sidecar.repo.connect() as conn:
+            conn.execute(
+                "UPDATE active_subscription_registry SET state='suspect_missing' WHERE identity_key=?",
+                (next(iter(local_keys)),),
+            )
+        deferred = importer.import_once()
+        self.assertEqual(deferred["imported"], 0)
+        self.assertEqual(deferred["failed_homes"], 1)
+        self.assertEqual(self.rows("SELECT * FROM usage_events"), [])
+        self.sidecar.repo.reconcile_subscription_inventory(local_keys | {managed_key})
         alpha = importer.import_once()
         self.assertEqual(alpha["imported"], 1)
         self.assertEqual(alpha["baselined_files"], 0)
+        alpha_key = self.rows("SELECT identity_key FROM usage_events")[0]["identity_key"]
+        self.assertRegex(alpha_key, r"^subscription:[0-9a-f]{32}$")
+        active = resolver.active_subscription_keys(force_refresh=True)
+        self.assertIn(alpha_key, active)
+        self.assertEqual(
+            resolver.resolve_identity_key(alpha_key).account_email,
+            "dynamic-alpha@example.test",
+        )
+        # A complete provider refresh must retain an independently signed-in
+        # local member, and local discovery must not retire the provider pool.
+        self.sidecar.repo.reconcile_subscription_inventory(active | {managed_key})
+        self.assertEqual(
+            {row["state"] for row in self.rows("SELECT state FROM active_subscription_registry")},
+            {"active"},
+        )
+        self.assertTrue(self.rows("SELECT * FROM subscription_quota_snapshots"))
 
         (app_home / "auth.json").write_text(json.dumps(auth_b), encoding="utf-8")
         with session.open("a", encoding="utf-8") as handle:
@@ -2273,6 +2305,13 @@ class UsageMeterMVPTest(unittest.TestCase):
         beta = importer.import_once()
         self.assertEqual(beta["imported"], 1)
         self.assertEqual(beta["baselined_files"], 0)
+        active = resolver.active_subscription_keys(force_refresh=True)
+        self.assertNotIn(alpha_key, active)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(
+            resolver.resolve_identity_key(next(iter(active))).account_email,
+            "dynamic-beta@example.test",
+        )
 
         new_session = sessions / "rollout-dynamic-new.jsonl"
         new_session.write_text(
@@ -2337,6 +2376,8 @@ class UsageMeterMVPTest(unittest.TestCase):
             self.assertNotIn(marker.encode(), persisted)
 
     def test_dynamic_local_import_discovers_cockpit_instances_independently(self) -> None:
+        managed_key = subscription_key("managed-instances-fixture")
+        self.sidecar.repo.reconcile_subscription_inventory({managed_key})
         cockpit_dir = self.temp_path / ".antigravity_cockpit"
         cockpit_dir.mkdir()
         primary = self.temp_path / ".codex"
@@ -2443,6 +2484,51 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(status["matched_homes"], 2)
         self.assertNotIn(str(primary), json.dumps(status))
         self.assertNotIn(str(instance), json.dumps(status))
+        active = resolver.active_subscription_keys(force_refresh=True)
+        self.assertEqual(len(active), 2)
+        self.assertEqual(
+            {row["identity_key"] for row in self.rows("SELECT identity_key FROM usage_events")},
+            active,
+        )
+        self.assertEqual(
+            {resolver.resolve_identity_key(key).account_email for key in active},
+            {"instance-1@example.test", "instance-2@example.test"},
+        )
+
+        # Removing one configured home removes only its contribution.
+        (cockpit_dir / "codex_instances.json").write_text(
+            json.dumps({"instances": []}), encoding="utf-8"
+        )
+        importer.import_once()
+        active = resolver.active_subscription_keys(force_refresh=True)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(
+            resolver.resolve_identity_key(next(iter(active))).account_email,
+            "instance-1@example.test",
+        )
+
+    def test_local_member_observation_preserves_existing_deletion_state(self) -> None:
+        key = subscription_key("deleted-local-member-fixture")
+        self.sidecar.repo.reconcile_subscription_inventory({key})
+        with self.sidecar.repo.connect() as conn:
+            conn.execute(
+                "UPDATE active_subscription_registry SET state='suspect_missing' WHERE identity_key=?",
+                (key,),
+            )
+        self.sidecar.repo.register_codex_app_subscription(key)
+        self.assertEqual(
+            self.rows("SELECT state FROM active_subscription_registry")[0]["state"],
+            "suspect_missing",
+        )
+        with self.sidecar.repo.connect() as conn:
+            conn.execute("DELETE FROM active_subscription_registry WHERE identity_key=?", (key,))
+            conn.execute(
+                "INSERT INTO retired_subscription_tombstones VALUES (?, ?, 1)",
+                (key, meter.utc_now()),
+            )
+        self.sidecar.repo.register_codex_app_subscription(key)
+        self.assertEqual(self.rows("SELECT * FROM active_subscription_registry"), [])
+        self.assertEqual(len(self.rows("SELECT * FROM retired_subscription_tombstones")), 1)
 
     def test_invalid_structured_email_does_not_mask_valid_jwt_email(self) -> None:
         account, _tokens, email, principal, _provider_id = (
@@ -2904,6 +2990,40 @@ class UsageMeterMVPTest(unittest.TestCase):
             self.assertEqual(row["long_input_per_million"], 10.0)
             self.assertEqual(row["long_cached_input_per_million"], 1.0)
             self.assertEqual(row["long_output_per_million"], 45.0)
+
+    def test_astra_official_rates_include_cache_and_context_threshold(self) -> None:
+        document = """
+        <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="TextTokenPricingTables">
+            <table><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th></tr>
+            <tr><td>gpt-6-astra</td><td>$10</td><td>$1</td><td>$50</td></tr>
+            <tr><td>gpt-6-unpriced-fixture</td><td>$2</td><td>$0.2</td><td>$12</td></tr></table>
+          </astro-island>
+        </div>
+        """
+        rows = meter.parse_official_pricing_html(document)
+        astra = rows[0]
+        self.assertEqual(astra["cache_write_per_million"], 12.5)
+        self.assertEqual(astra["long_context_threshold_tokens"], 272000)
+        self.assertEqual(astra["long_input_per_million"], 20)
+        self.assertEqual(astra["long_cached_input_per_million"], 2)
+        self.assertEqual(astra["long_cache_write_per_million"], 25)
+        self.assertEqual(astra["long_output_per_million"], 75)
+        self.assertIsNone(rows[1].get("long_context_threshold_tokens"))
+        components = self.sidecar.repo._components_for_price(
+            meter.NormalizedUsage(input_tokens=112075, cached_tokens=110720, output_tokens=2049),
+            astra,
+        )
+        self.assertAlmostEqual(components.non_cached_input_cost_usd, 0.01355)
+        self.assertAlmostEqual(components.cached_input_cost_usd, 0.11072)
+        self.assertAlmostEqual(components.output_cost_usd, 0.10245)
+        self.assertAlmostEqual(components.total_cost_usd, 0.22672)
+        for input_tokens, is_long in ((272000, False), (272001, True)):
+            components = self.sidecar.repo._components_for_price(
+                meter.NormalizedUsage(input_tokens=input_tokens, cached_tokens=270000, output_tokens=100),
+                astra,
+            )
+            self.assertEqual(components.long_context_pricing_applied, is_long)
 
     def test_official_pricing_parser_uses_complete_ssr_props_not_collapsed_rows(self) -> None:
         fake_html = """

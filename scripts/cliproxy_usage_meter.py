@@ -59,7 +59,7 @@ DEFAULT_UPSTREAM = "http://127.0.0.1:8317"
 DEFAULT_DB = PROJECT_ROOT / "datas" / "cliproxy_usage.sqlite"
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 OFFICIAL_PRICING_HOSTS = {"developers.openai.com", "platform.openai.com"}
-OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v2-long-context"
+OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v3-astra-context"
 LONG_CONTEXT_THRESHOLD_TOKENS = 272_000
 DEFAULT_USAGE_QUEUE_PATH = "/v0/management/usage-queue"
 DEFAULT_USAGE_QUEUE_COUNT = 100
@@ -783,6 +783,10 @@ class AccountResolver:
         # these identities are ever written to the meter database.
         self._sub2api_accounts: dict[str, AccountIdentity] = {}
         self._sub2api_identity_keys: dict[str, AccountIdentity] = {}
+        # Independently signed-in Codex homes are an account source too.
+        # Keep their labels across provider rescans, exclusively in memory.
+        self._codex_app_homes: dict[str, AccountIdentity] = {}
+        self._codex_app_identity_keys: dict[str, AccountIdentity] = {}
 
     def configure_cockpit_sources(
         self,
@@ -999,9 +1003,12 @@ class AccountResolver:
         canonical = self._legacy_identity_keys.get(key, key)
         return self._identity_keys.get(
             canonical,
-            self._sub2api_identity_keys.get(
+            self._codex_app_identity_keys.get(
                 canonical,
-                AccountIdentity(None, None, None),
+                self._sub2api_identity_keys.get(
+                    canonical,
+                    AccountIdentity(None, None, None),
+                ),
             ),
         )
 
@@ -1019,7 +1026,39 @@ class AccountResolver:
         """Return current local canonical keys without exposing their inputs."""
 
         self._refresh_if_needed(force=force_refresh)
-        return set(self._active_subscription_keys) | set(self._sub2api_identity_keys)
+        return (
+            set(self._active_subscription_keys)
+            | set(self._sub2api_identity_keys)
+            | set(self._codex_app_identity_keys)
+        )
+
+    def register_codex_app_home(
+        self, home_key: str, identity: AccountIdentity
+    ) -> None:
+        """Publish a stable local auth observation without persisting labels."""
+
+        with self._lock:
+            self._codex_app_homes[home_key] = identity
+            self._codex_app_identity_keys = {
+                key: item
+                for item in self._codex_app_homes.values()
+                if (key := canonical_subscription_key(resolved_identity_key(item)))
+            }
+
+    def retain_codex_app_homes(self, home_keys: set[str]) -> None:
+        """Drop contributions from homes no longer configured for collection."""
+
+        with self._lock:
+            self._codex_app_homes = {
+                key: identity
+                for key, identity in self._codex_app_homes.items()
+                if key in home_keys
+            }
+            self._codex_app_identity_keys = {
+                key: item
+                for item in self._codex_app_homes.values()
+                if (key := canonical_subscription_key(resolved_identity_key(item)))
+            }
 
     def register_sub2api_accounts(
         self,
@@ -3981,6 +4020,38 @@ class UsageRepository:
             self._privacy_checkpoint_pending = True
             LOG.warning("%s WAL checkpoint failed; retry pending", reason)
             return False
+
+    def register_codex_app_subscription(self, identity_key_value: str) -> bool:
+        """Admit a newly observed local member before writing its first usage.
+
+        This positive observation cannot retire other sources or reactivate a
+        tombstone. Existing deletion state still requires a complete inventory
+        reconciliation, whose union includes the registered local homes.
+        """
+
+        key = canonical_subscription_key(identity_key_value)
+        if not key:
+            return False
+        with self.connect() as conn:
+            if self._subscription_detail_allowed_conn(conn, key):
+                return True
+            now = utc_now()
+            conn.execute(
+                """INSERT OR IGNORE INTO active_subscription_registry (
+                     identity_key, state, first_seen_at, last_seen_at,
+                     missing_since, consecutive_misses, last_scan_generation,
+                     high_risk_missing
+                   ) SELECT ?, 'active', ?, ?, NULL, 0,
+                            COALESCE((SELECT generation
+                                       FROM subscription_inventory_state
+                                      WHERE id=1), 0), 0
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM retired_subscription_tombstones
+                         WHERE identity_key=?
+                      )""",
+                (key, now, now, key),
+            )
+            return self._subscription_detail_allowed_conn(conn, key)
 
     def reconcile_subscription_inventory(
         self,
@@ -7370,8 +7441,9 @@ def _parse_pricing_props_rows(fragment: str) -> list[dict[str, Any]]:
 def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Derive documented Standard long tiers when the page omits props fields.
 
-    OpenAI model pages state that GPT-5.4/5.5 1.05M models and the GPT-5.6
-    family charge 2x input and 1.5x output above 272K input tokens.  The same
+    OpenAI model pages state that GPT-5.4/5.5 1.05M models, the GPT-5.6
+    family and GPT-6 Astra charge 2x input and 1.5x output above 272K input
+    tokens (https://developers.openai.com/api/docs/models/gpt-6-astra). The same
     pricing page defines cache writes as 1.25x input and cached reads as their
     own input category.  Apply this only to the explicitly documented model
     IDs, never to similarly named mini/nano/cyber variants.
@@ -7385,6 +7457,7 @@ def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-6-astra",
     }
     completed: list[dict[str, Any]] = []
     for source in rows:
@@ -7404,7 +7477,11 @@ def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         row["long_cached_input_per_million"] = (
             float(cached_rate) * 2.0 if cached_rate is not None else None
         )
-        if cache_write_rate is None and input_rate is not None and str(model).startswith("gpt-5.6-"):
+        if (
+            cache_write_rate is None
+            and input_rate is not None
+            and (str(model).startswith("gpt-5.6-") or model == "gpt-6-astra")
+        ):
             cache_write_rate = float(input_rate) * 1.25
             row["cache_write_per_million"] = cache_write_rate
         row["long_cache_write_per_million"] = (
@@ -9565,6 +9642,7 @@ class CodexAppLocalImporter:
         self._account_match = None
         self._member_match = None
         homes, rejected = self._discover_homes()
+        self.resolver.retain_codex_app_homes({self._home_key(home) for home in homes})
         imported = 0
         quota_rows = 0
         scanned_files = 0
@@ -9613,6 +9691,16 @@ class CodexAppLocalImporter:
                 and refreshed.auth_signature == context.auth_signature
             )
             if not stable_auth or any(not scan.ok for scan in scans):
+                failed_homes += 1
+                continue
+            self.resolver.register_codex_app_home(home_key, context.identity)
+            admitted = self.repo.register_codex_app_subscription(
+                resolved_identity_key(context.identity)
+            )
+            if context.identity.subscription_id_hash and not admitted:
+                # A provider refresh may have sampled the inventory before
+                # this home was registered. Retain cursors until its next
+                # complete union admits the member instead of losing linkage.
                 failed_homes += 1
                 continue
             imported_delta, quota_delta = self._commit_scans(scans)
