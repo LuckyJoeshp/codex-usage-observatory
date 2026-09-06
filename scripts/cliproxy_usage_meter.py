@@ -96,14 +96,14 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 COCKPIT_TOOLS_TERMINAL_ACCOUNT_ERROR_CODES = frozenset(
     {"deactivated_workspace", "token_invalidated"}
 )
-# Sources that represent an actual API request/response.  Local Codex token
-# imports and manual imports have no HTTP response status and intentionally
-# stay out of the response health timeline.
+# Request observations, including local Codex completions whose successful
+# usage imports carry a synthetic 200. Manual token totals are not requests.
 RESPONSE_TIMELINE_SOURCES = (
     "sidecar",
     "usage_queue",
     COCKPIT_TOOLS_REQUEST_SOURCE,
     SUB2API_REQUEST_SOURCE,
+    "codex_app_local",
 )
 # Version 2 removes pre-account gateway responses from the HTTP health
 # timeline while retaining them in the usage/failure history.
@@ -6234,12 +6234,13 @@ class UsageRepository:
     ) -> dict[str, Any]:
         """Return the dense one-minute HTTP response timeline.
 
-        ``status_200`` deliberately means *exactly* HTTP 200.  Every other
-        status (including the synthetic 502 recorded when the upstream does
-        not answer) is counted in ``status_non_200``.  The fixed scope includes
-        proxy, usage-queue, and Cockpit Tools request events that reached an
-        upstream API.  Local gateway decisions made before account selection
-        are retained in usage history but are excluded.
+        ``status_200`` counts status 200, including the synthetic success
+        status on local Codex usage imports. Local imports cannot observe
+        HTTP failures. Every other status (including the synthetic 502 when
+        the upstream does not answer) is counted in ``status_non_200``. The
+        fixed scope includes proxy, usage-queue, Cockpit Tools, Sub2API, and
+        local Codex request events. Local gateway decisions made before
+        account selection and manual token totals are excluded.
 
         The returned buckets are UTC and include zero-valued minutes so a
         client can draw a continuous line without inventing missing samples.
@@ -10994,7 +10995,7 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
     </div>
   </div>
   <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">账号选择后 API · 每分钟</div></div>
-  <div class="timeline-footnote">时间轴固定合并 Sub2API、Cockpit Tools、8327 代理与 8317 队列中已进入账号选择阶段的请求；账号选择前的网关拒绝不进入时间轴。分钟观测不含账号信息，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
+  <div class="timeline-footnote">时间轴固定合并 Sub2API、Cockpit Tools、Codex 本地、8327 代理与 8317 队列中已进入账号选择阶段的请求；账号选择前的网关拒绝不进入时间轴。Codex 本地成功用量归入 200 线，状态为推定成功；本地日志不提供完整 HTTP 失败记录，手动汇总不计入。分钟观测不含账号信息，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
 </section>
 <script id="response-timeline-data" type="application/json">{payload_json}</script>
 """

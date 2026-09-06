@@ -496,9 +496,9 @@ Cockpit 与 Sub2API importer 的脱敏状态也由 `/healthz` 提供。页面只
 
 - 累计、今日、近 7 日的实际消耗（非缓存输入 + 输出）、缓存输入、API 原始处理量、
   输出、推理 token、缓存命中率与 API 等价成本。
-- 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，固定合并 Sub2API、
-  Cockpit Tools、8327 sidecar 与 8317 usage queue 中已进入账号选择阶段的 API 请求；
-  账号选择前的网关拒绝排除在外，无上游响应时 sidecar 写入的 502 归入非 200 线。
+- 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，固定合并 Codex 本地、
+  Sub2API、Cockpit Tools、8327 sidecar 与 8317 usage queue 的请求记录；Codex 本地成功用量
+  以推定的 200 计入。账号选择前的网关拒绝排除在外，无上游响应时 sidecar 写入的 502 归入非 200 线。
 - 近 7 天 token/cost 柱状趋势。
 - 每个 Codex 订阅按实际窗口时长归类的 5 小时、周或月剩余百分比、重置时间与 provider gate 状态。
 - 每账号当前周期已观测美元下限，以及基于 provider 周/月窗口的 API 等价满额度估值。
@@ -512,14 +512,16 @@ GET /usage/timeline?minutes=1440
 ```
 
 `minutes` 可取 `1`～`10080`（最多 7 天），返回连续的 UTC 分钟桶；没有调用的分钟也会返回
-零值。接口固定包含 `sidecar`、`usage_queue` 和 `cockpit_tools` 三类 API 来源，不提供单来源
-筛选，也不把账号选择前的网关拒绝或缺少 HTTP 状态的本地/手动 token 导入混入响应曲线。每个 point 的
-`status_200` 只统计精确的 HTTP 200，`status_non_200` 统计其余状态，`total` 为两者之和。
+零值。接口固定包含 `sidecar`、`usage_queue`、`cockpit_tools`、`sub2api` 和 `codex_app_local`
+五类来源，不提供单来源筛选。账号选择前的网关拒绝和手动 token 汇总不计入响应曲线。每个 point 的
+`status_200` 统计状态码为 200 的记录，含 Codex 本地成功用量的推定 200；本地日志不提供完整的
+HTTP 失败记录，因此不能据此推断直连 Codex 的完整失败率。`status_non_200` 统计其余状态，`total` 为两者之和。
 顶层 `totals` 提供同一窗口汇总。接口带 `Cache-Control: no-store`，不返回账号、模型、错误正文
 或其他身份字段。
 
 响应状态另存为只包含“分钟、状态码、调用数、来源”的匿名观测，不依赖可被账号退役流程删除的
-`usage_events` 明细。升级后 Cockpit importer 会对原始 `request_logs` 做一次幂等回扫，补回此前
+`usage_events` 明细。启动时从已有请求明细幂等回填，包括先前未进入时间轴的 Codex 本地记录。
+升级后 Cockpit importer 会对原始 `request_logs` 做一次幂等回扫，补回此前
 已导入但随账号明细一同清理的历史响应分钟；后续账号退役不会再造成时间轴断层。
 
 两条线同时为 0 只表示该分钟没有采集到请求，不能据此证明服务可用；当请求经过 8327 且上游

@@ -1741,6 +1741,7 @@ class UsageMeterMVPTest(unittest.TestCase):
                     ("fixture-4", "2026-08-17T12:32:00Z", 502, 4, "cockpit_tools"),
                     ("fixture-5", "2026-08-17T12:32:00Z", 200, 5, "manual_codex_app"),
                     ("fixture-6", "2026-08-17T12:29:00Z", 500, 7, "sidecar"),
+                    ("fixture-7", "2026-08-17T12:32:00Z", 200, 2, "codex_app_local"),
                 ),
             )
 
@@ -1758,23 +1759,67 @@ class UsageMeterMVPTest(unittest.TestCase):
                 (point["status_200"], point["status_non_200"])
                 for point in timeline["points"]
             ],
-            [(1, 0), (3, 0), (0, 6)],
+            [(1, 0), (3, 0), (2, 6)],
         )
         self.assertEqual(
             timeline["totals"],
             {
-                "status_200": 4,
+                "status_200": 6,
                 "status_non_200": 6,
-                "total": 10,
+                "total": 12,
             },
         )
         self.assertEqual(
             timeline["sources"],
-            ["sidecar", "usage_queue", "cockpit_tools", "sub2api"],
+            ["sidecar", "usage_queue", "cockpit_tools", "sub2api", "codex_app_local"],
         )
         self.assertEqual(timeline["source"], "api")
         with self.assertRaises(ValueError):
             self.sidecar.repo.response_timeline(0, now=now)
+
+    def test_response_timeline_backfills_existing_local_codex_attempts(self) -> None:
+        now = datetime(2026, 8, 17, 12, 32, 59, tzinfo=timezone.utc)
+        with self.sidecar.repo.connect() as conn:
+            for index, timestamp in enumerate(
+                ("2026-08-17T20:31:03.123000+08:00", "2026-08-17T12:32:04Z")
+            ):
+                cursor = conn.execute(
+                    """INSERT INTO usage_events
+                       (ts, status_code, ok, call_count, source, account_attempt)
+                       VALUES (?, 200, 1, 1, 'codex_app_local', 1)""",
+                    (timestamp,),
+                )
+                if index == 0:
+                    conn.execute(
+                        """INSERT INTO local_import_records
+                           (import_key, source, usage_event_id, imported_at)
+                           VALUES ('codex-app:fixture', 'codex_app_local', ?, ?)""",
+                        (cursor.lastrowid, timestamp),
+                    )
+                else:
+                    legacy_id = cursor.lastrowid
+
+        self.assertEqual(len(self.sidecar.repo.recent_account_attempts(50)), 2)
+        self.assertEqual(
+            self.sidecar.repo.response_timeline(2, now=now)["totals"]["total"], 0
+        )
+        for _ in range(2):
+            reopened = meter.UsageRepository(self.db)
+            timeline = reopened.response_timeline(2, now=now)
+            self.assertEqual(
+                timeline["totals"],
+                {"status_200": 2, "status_non_200": 0, "total": 2},
+            )
+            self.assertEqual(
+                [point["status_200"] for point in timeline["points"]], [1, 1]
+            )
+            self.assertEqual(
+                {
+                    row["observation_key"]
+                    for row in self.rows("SELECT observation_key FROM api_response_observations")
+                },
+                {"import:codex-app:fixture", f"usage:{legacy_id}"},
+            )
 
     def test_dashboard_and_all_required_cli_queries(self) -> None:
         self.request("POST", "/v1/responses", {"model": "fake-responses"})
@@ -1949,6 +1994,11 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(first["imported"], 1)
         self.assertEqual(second["imported"], 0)
         self.assertEqual(second["quota_rows"], 0)
+        now = datetime(2026, 8, 13, 7, 0, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self.sidecar.repo.response_timeline(1, now=now)["totals"],
+            {"status_200": 1, "status_non_200": 0, "total": 1},
+        )
         appended = {
             **records[-1],
             "timestamp": "2026-08-13T07:00:04Z",
@@ -1959,6 +2009,10 @@ class UsageMeterMVPTest(unittest.TestCase):
         third = importer.import_once()
         self.assertEqual(third["imported"], 1)
         self.assertEqual(third["quota_rows"], 1)
+        self.assertEqual(
+            self.sidecar.repo.response_timeline(1, now=now)["totals"],
+            {"status_200": 2, "status_non_200": 0, "total": 2},
+        )
         row = self.rows("SELECT * FROM usage_events WHERE source='codex_app_local'")[0]
         self.assertIsNone(row["usage_alias"])
         self.assertIsNone(row["session_id"])
