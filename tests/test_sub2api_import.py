@@ -266,6 +266,35 @@ class Sub2APIImporterTest(unittest.TestCase):
         self.fake_thread.join(timeout=2)
         self.temp.cleanup()
 
+    def test_astra_long_context_import_uses_flat_rates_without_replay_churn(self) -> None:
+        self.repo.set_price("gpt-6-astra", 10, 50, 1, "fixture pricing")
+        record = self.fake.usage[0]
+        record.update({
+            "model": "gpt-6-astra", "input_tokens": 100000,
+            "cache_creation_tokens": 0, "cache_read_tokens": 200000,
+            "output_tokens": 10000, "input_cost": 2.0,
+            "cache_creation_cost": 0.0, "cache_read_cost": 0.4,
+            "output_cost": 0.75, "total_cost": 3.15,
+            "long_context_billing_applied": True,
+        })
+        self.assertEqual(self.importer.import_once()["new"], 1)
+        with self.repo.connect() as conn:
+            event = conn.execute("SELECT * FROM usage_events").fetchone()
+        self.assertAlmostEqual(event["non_cached_input_cost_usd"], 1.0)
+        self.assertAlmostEqual(event["cached_input_cost_usd"], 0.2)
+        self.assertAlmostEqual(event["output_cost_usd"], 0.5)
+        self.assertAlmostEqual(event["estimated_api_cost_usd"], 1.7)
+        self.assertEqual(event["long_context_pricing_applied"], 0)
+        repeated = self.importer.import_once()
+        self.assertEqual(repeated["unchanged"], 1)
+        self.assertEqual(repeated["write_transactions"], 0)
+        self.assertEqual(record["total_cost"], 3.15)
+
+        record["model"] = "gpt-5.6-sol"
+        converted = self.importer._event_from_record(record)[0]
+        self.assertAlmostEqual(converted.estimated_api_cost_usd, 3.15)
+        self.assertEqual(converted.long_context_pricing_applied, 1)
+
     def test_imports_paginated_usage_quota_and_accounts_idempotently(self) -> None:
         first = self.importer.import_once()
         self.assertEqual(

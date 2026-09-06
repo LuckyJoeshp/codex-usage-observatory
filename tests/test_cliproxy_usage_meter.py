@@ -3045,7 +3045,7 @@ class UsageMeterMVPTest(unittest.TestCase):
             self.assertEqual(row["long_cached_input_per_million"], 1.0)
             self.assertEqual(row["long_output_per_million"], 45.0)
 
-    def test_astra_official_rates_include_cache_and_context_threshold(self) -> None:
+    def test_astra_official_rates_are_identical_for_all_context_lengths(self) -> None:
         document = """
         <div data-content-switcher-pane="true" data-value="standard">
           <astro-island component-export="TextTokenPricingTables">
@@ -3058,11 +3058,11 @@ class UsageMeterMVPTest(unittest.TestCase):
         rows = meter.parse_official_pricing_html(document)
         astra = rows[0]
         self.assertEqual(astra["cache_write_per_million"], 12.5)
-        self.assertEqual(astra["long_context_threshold_tokens"], 272000)
-        self.assertEqual(astra["long_input_per_million"], 20)
-        self.assertEqual(astra["long_cached_input_per_million"], 2)
-        self.assertEqual(astra["long_cache_write_per_million"], 25)
-        self.assertEqual(astra["long_output_per_million"], 75)
+        self.assertIsNone(astra.get("long_context_threshold_tokens"))
+        self.assertIsNone(astra.get("long_input_per_million"))
+        self.assertIsNone(astra.get("long_cached_input_per_million"))
+        self.assertIsNone(astra.get("long_cache_write_per_million"))
+        self.assertIsNone(astra.get("long_output_per_million"))
         self.assertIsNone(rows[1].get("long_context_threshold_tokens"))
         components = self.sidecar.repo._components_for_price(
             meter.NormalizedUsage(input_tokens=112075, cached_tokens=110720, output_tokens=2049),
@@ -3072,12 +3072,21 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertAlmostEqual(components.cached_input_cost_usd, 0.11072)
         self.assertAlmostEqual(components.output_cost_usd, 0.10245)
         self.assertAlmostEqual(components.total_cost_usd, 0.22672)
-        for input_tokens, is_long in ((272000, False), (272001, True)):
+        for input_tokens in (272000, 272001, 1000000):
             components = self.sidecar.repo._components_for_price(
-                meter.NormalizedUsage(input_tokens=input_tokens, cached_tokens=270000, output_tokens=100),
+                meter.NormalizedUsage(
+                    input_tokens=input_tokens, cached_tokens=270000,
+                    cache_write_tokens=1000, output_tokens=100,
+                ),
                 astra,
             )
-            self.assertEqual(components.long_context_pricing_applied, is_long)
+            self.assertFalse(components.long_context_pricing_applied)
+            self.assertAlmostEqual(
+                components.non_cached_input_cost_usd,
+                ((input_tokens - 271000) * 10 + 1000 * 12.5) / 1000000,
+            )
+            self.assertAlmostEqual(components.cached_input_cost_usd, 0.27)
+            self.assertAlmostEqual(components.output_cost_usd, 0.005)
 
     def test_official_pricing_parser_uses_complete_ssr_props_not_collapsed_rows(self) -> None:
         fake_html = """

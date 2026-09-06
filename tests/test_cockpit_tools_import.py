@@ -229,6 +229,28 @@ class CockpitToolsImporterTest(unittest.TestCase):
             connection.row_factory = sqlite3.Row
             return connection.execute("SELECT * FROM usage_events ORDER BY id").fetchall()
 
+    def test_astra_import_corrects_long_rates_and_keeps_flat_rates(self) -> None:
+        self.repo.set_price("gpt-6-astra", 10, 50, 1, "fixture pricing")
+        self._insert_request("astra-context-fixture", 1_786_665_600)
+        for version, input_rate, cached_rate, output_rate in (
+            (2, 20, 2, 75), (3, 10, 1, 50),
+        ):
+            with sqlite3.connect(self.importer.database_path) as conn:
+                conn.execute(
+                    """UPDATE request_logs SET model_id='gpt-6-astra',
+                              input_tokens=300000, cached_tokens=200000,
+                              output_tokens=10000, total_tokens=310000,
+                              token_breakdown_json='', model_pricing_version=?,
+                              input_usd_per_million=?, cached_input_usd_per_million=?,
+                              output_usd_per_million=?""",
+                    (version, input_rate, cached_rate, output_rate),
+                )
+            self.importer.import_once()
+            row = self._usage_rows()[0]
+            self.assertAlmostEqual(row["estimated_api_cost_usd"], 1.7)
+            self.assertEqual(row["long_context_pricing_applied"], 0)
+        self.assertEqual(len(self._usage_rows()), 1)
+
     def test_imports_tokens_frozen_cost_and_quota_without_sensitive_fields(self) -> None:
         raw_event_key = "cockpit-event-key-never-persist"
         self._insert_request(raw_event_key, 1_786_665_600)

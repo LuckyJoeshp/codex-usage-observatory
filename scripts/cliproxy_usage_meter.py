@@ -59,7 +59,7 @@ DEFAULT_UPSTREAM = "http://127.0.0.1:8317"
 DEFAULT_DB = PROJECT_ROOT / "datas" / "cliproxy_usage.sqlite"
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 OFFICIAL_PRICING_HOSTS = {"developers.openai.com", "platform.openai.com"}
-OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v3-astra-context"
+OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v4-astra-flat-context"
 LONG_CONTEXT_THRESHOLD_TOKENS = 272_000
 DEFAULT_USAGE_QUEUE_PATH = "/v0/management/usage-queue"
 DEFAULT_USAGE_QUEUE_COUNT = 100
@@ -3141,6 +3141,7 @@ class UsageRepository:
                   FROM anonymous_usage_daily;
                 """
             )
+            self._correct_astra_context_costs(conn)
             self._backfill_frozen_cost_components(conn)
             self._upgrade_long_context_costs(conn)
 
@@ -3179,7 +3180,11 @@ class UsageRepository:
         ordinary_input_tokens = max(input_tokens - cached_tokens - cache_write_tokens, 0)
         long_context = False
         threshold = as_nonnegative_int(price.get("long_context_threshold_tokens"))
-        if threshold is not None and input_tokens > threshold:
+        if (
+            price.get("model_pattern") != "gpt-6-astra"
+            and threshold is not None
+            and input_tokens > threshold
+        ):
             long_rates = (
                 price.get("long_input_per_million"),
                 price.get("long_cached_input_per_million"),
@@ -3258,6 +3263,118 @@ class UsageRepository:
     def price_for(self, model: str | None, usage: NormalizedUsage) -> float | None:
         components = self.price_components_for(model, usage)
         return components.total_cost_usd if components is not None else None
+
+    @staticmethod
+    def _verified_astra_context_components(
+        frozen: PriceComponents,
+        short: PriceComponents | None,
+    ) -> PriceComponents:
+        """Correct only snapshots matching Astra's short or erroneous long rates."""
+
+        if short is None:
+            return frozen
+        actual = (
+            frozen.non_cached_input_cost_usd,
+            frozen.cached_input_cost_usd,
+            frozen.output_cost_usd,
+        )
+        for input_factor, output_factor in ((1.0, 1.0), (2.0, 1.5)):
+            expected = (
+                short.non_cached_input_cost_usd * input_factor,
+                short.cached_input_cost_usd * input_factor,
+                short.output_cost_usd * output_factor,
+            )
+            if all(
+                math.isclose(value, expected_cost, rel_tol=1e-9, abs_tol=1e-12)
+                for value, expected_cost in zip(actual, expected)
+            ):
+                return short
+        return frozen
+
+    def correct_astra_context_components(
+        self,
+        model: str | None,
+        usage: NormalizedUsage,
+        components: PriceComponents | None,
+    ) -> PriceComponents | None:
+        if (
+            model != "gpt-6-astra"
+            or components is None
+            or not components.long_context_pricing_applied
+            or (usage.input_tokens or 0) <= LONG_CONTEXT_THRESHOLD_TOKENS
+        ):
+            return components
+        return self._verified_astra_context_components(
+            components, self.price_components_for(model, usage)
+        )
+
+    def _correct_astra_context_costs(self, conn: sqlite3.Connection) -> int:
+        """Repair the known Astra surcharge while preserving unrelated snapshots."""
+
+        price = conn.execute(
+            """SELECT * FROM model_prices WHERE model_pattern='gpt-6-astra'
+                 AND source_kind='official' AND (currency='USD' OR currency IS NULL)"""
+        ).fetchone()
+        if price is None:
+            return 0
+        conn.execute(
+            """UPDATE model_prices SET long_context_threshold_tokens=NULL,
+                      long_input_per_million=NULL, long_cached_input_per_million=NULL,
+                      long_cache_write_per_million=NULL, long_output_per_million=NULL,
+                      source_note=COALESCE(source_note, '') ||
+                          '; corrected gpt-6-astra to flat context rates', updated_at=?
+                WHERE model_pattern='gpt-6-astra'
+                  AND (long_context_threshold_tokens IS NOT NULL
+                       OR long_input_per_million IS NOT NULL
+                       OR long_cached_input_per_million IS NOT NULL
+                       OR long_cache_write_per_million IS NOT NULL
+                       OR long_output_per_million IS NOT NULL)""",
+            (utc_now(),),
+        )
+        events = conn.execute(
+            """SELECT id, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
+                      estimated_api_cost_usd, non_cached_input_cost_usd,
+                      cached_input_cost_usd, output_cost_usd
+                 FROM usage_events
+                WHERE model='gpt-6-astra' AND long_context_pricing_applied=1
+                  AND input_tokens>? AND output_tokens IS NOT NULL
+                  AND estimated_api_cost_usd IS NOT NULL
+                  AND non_cached_input_cost_usd IS NOT NULL
+                  AND cached_input_cost_usd IS NOT NULL AND output_cost_usd IS NOT NULL""",
+            (LONG_CONTEXT_THRESHOLD_TOKENS,),
+        ).fetchall()
+        updated = 0
+        for event in events:
+            usage = NormalizedUsage(
+                input_tokens=event["input_tokens"], output_tokens=event["output_tokens"],
+                cached_tokens=event["cached_tokens"], cache_write_tokens=event["cache_write_tokens"],
+            )
+            frozen = PriceComponents(
+                non_cached_input_cost_usd=event["non_cached_input_cost_usd"],
+                cached_input_cost_usd=event["cached_input_cost_usd"],
+                output_cost_usd=event["output_cost_usd"],
+                long_context_pricing_applied=True,
+            )
+            if not math.isclose(
+                frozen.total_cost_usd, event["estimated_api_cost_usd"],
+                rel_tol=1e-9, abs_tol=1e-12,
+            ):
+                continue
+            corrected = self._verified_astra_context_components(
+                frozen, self._components_for_price(usage, price)
+            )
+            if corrected is frozen:
+                continue
+            conn.execute(
+                """UPDATE usage_events SET non_cached_input_cost_usd=?,
+                          cached_input_cost_usd=?, output_cost_usd=?,
+                          estimated_api_cost_usd=?, long_context_pricing_applied=0
+                    WHERE id=?""",
+                (corrected.non_cached_input_cost_usd, corrected.cached_input_cost_usd,
+                 corrected.output_cost_usd, corrected.total_cost_usd, event["id"]),
+            )
+            updated += 1
+        return updated
 
     def _backfill_frozen_cost_components(self, conn: sqlite3.Connection) -> int:
         """Safely split legacy totals without changing their frozen value.
@@ -3349,6 +3466,7 @@ class UsageRepository:
         prices = conn.execute(
             """SELECT * FROM model_prices
                 WHERE (currency='USD' OR currency IS NULL)
+                  AND model_pattern<>'gpt-6-astra'
                   AND long_context_threshold_tokens IS NOT NULL"""
         ).fetchall()
         if not prices:
@@ -4630,8 +4748,8 @@ class UsageRepository:
         )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            repriced_events = self._correct_astra_context_costs(conn)
             conn.execute("DELETE FROM model_prices WHERE source_kind='official'")
-            repriced_events = 0
             for row in rows:
                 conn.execute(
                     """
@@ -4715,6 +4833,7 @@ class UsageRepository:
                         ),
                     )
                     repriced_events += max(int(cursor.rowcount), 0)
+            repriced_events += self._correct_astra_context_costs(conn)
             repriced_events += self._upgrade_long_context_costs(conn)
             conn.execute(
                 """
@@ -7442,12 +7561,10 @@ def _parse_pricing_props_rows(fragment: str) -> list[dict[str, Any]]:
 def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Derive documented Standard long tiers when the page omits props fields.
 
-    OpenAI model pages state that GPT-5.4/5.5 1.05M models, the GPT-5.6
-    family and GPT-6 Astra charge 2x input and 1.5x output above 272K input
-    tokens (https://developers.openai.com/api/docs/models/gpt-6-astra). The same
-    pricing page defines cache writes as 1.25x input and cached reads as their
-    own input category.  Apply this only to the explicitly documented model
-    IDs, never to similarly named mini/nano/cyber variants.
+    GPT-5.4/5.5 1.05M models and the GPT-5.6 family charge 2x input and
+    1.5x output above 272K input tokens. GPT-6 Astra uses the same rates at
+    every context length. Cache writes remain 1.25x input for GPT-5.6/Astra.
+    Apply these rules only to the exact model IDs.
     """
 
     eligible = {
@@ -7471,13 +7588,6 @@ def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         cached_rate = row.get("cached_input_per_million")
         output_rate = row.get("output_per_million")
         cache_write_rate = row.get("cache_write_per_million")
-        row["long_context_threshold_tokens"] = LONG_CONTEXT_THRESHOLD_TOKENS
-        row["long_input_per_million"] = (
-            float(input_rate) * 2.0 if input_rate is not None else None
-        )
-        row["long_cached_input_per_million"] = (
-            float(cached_rate) * 2.0 if cached_rate is not None else None
-        )
         if (
             cache_write_rate is None
             and input_rate is not None
@@ -7485,6 +7595,22 @@ def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         ):
             cache_write_rate = float(input_rate) * 1.25
             row["cache_write_per_million"] = cache_write_rate
+        if model == "gpt-6-astra":
+            for field in (
+                "long_context_threshold_tokens", "long_input_per_million",
+                "long_cached_input_per_million", "long_cache_write_per_million",
+                "long_output_per_million",
+            ):
+                row[field] = None
+            completed.append(row)
+            continue
+        row["long_context_threshold_tokens"] = LONG_CONTEXT_THRESHOLD_TOKENS
+        row["long_input_per_million"] = (
+            float(input_rate) * 2.0 if input_rate is not None else None
+        )
+        row["long_cached_input_per_million"] = (
+            float(cached_rate) * 2.0 if cached_rate is not None else None
+        )
         row["long_cache_write_per_million"] = (
             float(cache_write_rate) * 2.0 if cache_write_rate is not None else None
         )
@@ -8306,6 +8432,7 @@ class CockpitToolsImporter:
             else (200 if success else 500)
         )
         model = safe_model_identifier(row.get("model_id"))
+        components = self.repo.correct_astra_context_components(model, usage, components)
         total_only_snapshot = self._safe_rate(row.get("estimated_cost_usd"))
         if total_only_snapshot is not None and total_only_snapshot <= 0:
             total_only_snapshot = None
@@ -8348,11 +8475,7 @@ class CockpitToolsImporter:
             ),
             output_cost_usd=(components.output_cost_usd if components else None),
             long_context_pricing_applied=int(
-                bool(
-                    components
-                    and model
-                    and (usage.input_tokens or 0) > LONG_CONTEXT_THRESHOLD_TOKENS
-                )
+                bool(components and model and components.long_context_pricing_applied)
             ),
             subscription_amortized_cost_usd=None,
             api_equivalent_quota_usd=None,
@@ -9096,6 +9219,24 @@ class Sub2APIImporter:
                 # the upstream values otherwise agree.
                 estimated_cost = component_total
 
+        model = safe_model_identifier(record.get("model"))
+        long_context = bool(record.get("long_context_billing_applied"))
+        if non_cached_cost is not None and cached_cost is not None and output_cost is not None:
+            components = self.repo.correct_astra_context_components(
+                model,
+                NormalizedUsage(
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    cached_tokens=cached_tokens, cache_write_tokens=cache_write_tokens,
+                ),
+                PriceComponents(non_cached_cost, cached_cost, output_cost, long_context),
+            )
+            assert components is not None
+            non_cached_cost = components.non_cached_input_cost_usd
+            cached_cost = components.cached_input_cost_usd
+            output_cost = components.output_cost_usd
+            estimated_cost = components.total_cost_usd
+            long_context = components.long_context_pricing_applied
+
         stream = bool(record.get("stream")) or safe_text(
             record.get("request_type"), 32
         ) in {"stream", "ws_v2", "live"}
@@ -9104,7 +9245,7 @@ class Sub2APIImporter:
             identity_key=identity_key_value,
             endpoint="local://sub2api",
             method="LOCAL",
-            model=safe_model_identifier(record.get("model")),
+            model=model,
             status_code=200,
             ok=1,
             duration_ms=as_nonnegative_int(record.get("duration_ms")) or 0,
@@ -9129,9 +9270,7 @@ class Sub2APIImporter:
             non_cached_input_cost_usd=non_cached_cost,
             cached_input_cost_usd=cached_cost,
             output_cost_usd=output_cost,
-            long_context_pricing_applied=int(
-                bool(record.get("long_context_billing_applied"))
-            ),
+            long_context_pricing_applied=int(long_context),
             subscription_amortized_cost_usd=None,
             api_equivalent_quota_usd=None,
             usage_missing=0,
@@ -11369,7 +11508,7 @@ def dashboard_html(
         f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
-        f'<td>{"长上下文" if row.get("long_context_pricing_applied") else "短上下文"}</td>'
+        f'<td>{"统一费率" if row.get("model") == "gpt-6-astra" else ("长上下文" if row.get("long_context_pricing_applied") else "短上下文")}</td>'
         f'<td>{fmt_money(row["non_cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["output_cost_usd"])}</td>'
         f'<td>{fmt_money(row["cached_input_cost_usd"])}</td>'
@@ -11553,7 +11692,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 	{sub2api_notice}
 	{manual_import}
 {session_notice}
-<div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
+<div class="notice"><b>按模型计费</b><span>gpt-6-astra 长短上下文统一费率，不加收长上下文费用。其他具有长上下文价格档的模型，按每次调用完整 input tokens 判断：≤272K 使用短档，&gt;272K 使用长档；cached tokens 计入输入阈值，并按对应缓存单价计费。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
 <section class="period-grid">{period_cards}</section>
 {response_timeline_chart}
@@ -11566,7 +11705,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 	<div class="system-strip"><span>CLIProxyAPI queue <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>Sub2API <b>{html.escape(sub2api_strip_text)}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
-<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
+<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算；gpt-6-astra 已核实的错误长上下文加价会校正为短档费率。gpt-6-astra 不启用长上下文加价，其他具有长档的模型仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script><script>{RESPONSE_TIMELINE_SCRIPT}</script></body></html>"""
 
 
