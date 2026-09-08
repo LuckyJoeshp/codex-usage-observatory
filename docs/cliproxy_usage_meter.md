@@ -414,7 +414,7 @@ Cockpit Tools 的窗口名称不是稳定语义：当前版本可能把 7 天（
 
 未知价格时 `estimated_api_cost_usd` 为 `NULL`，不会伪造价格。推荐从
 [OpenAI 官方 API 定价页](https://developers.openai.com/api/docs/pricing)显式同步
-Standard 的 short/long-context input、cached input、cache write、output 单价
+Standard 和 Fast 的 short/long-context input、cached input、cache write、output 单价
 （USD / 每百万 token）：
 
 ```bash
@@ -442,6 +442,29 @@ $PY scripts/cliproxy_usage_meter.py --db datas/cliproxy_usage.sqlite \
 为 Astra 推导的长档，并校正费用拆分和总额能核对出上述错误倍率的历史记录。Sub2API
 和 Cockpit Tools 后续导入也使用同样的校正规则，避免重复导入恢复错误加价；无法核实
 来源的自定义费用、只有总额的快照保持原值。这些校正只影响看板 API 等价成本。
+
+### Fast 服务等级
+
+逐请求保存 `service_tier`、`requested_service_tier` 和 `service_tier_source`；
+`priority` 与 `fast` 统一为 Fast，`default` 与 `standard` 统一为 Standard。
+8327 代理优先采用 JSON/SSE 响应的实际等级；请求 Fast 而响应 `default` 时按
+Standard 计价。只有请求标记时显示“请求估算”，缺少标记的历史和本地记录显示
+“模式未知”，不使用当前配置倒推过去的模式。本地日志提供等级时，按该轮次估价。
+
+本项目的 Astra 上下文统一规则在两种速度下分别适用：Standard 的输入、缓存输入、
+输出为 `$10 / $1 / $50` 每百万 token，Fast 为 `$20 / $2 / $100`；cache write
+分别为 `$12.50 / $25`。价格仍从官方表同步，不将所有模型统一乘一个倍率。
+未同步或官方未提供的 Fast 价格保持未计价，不能退回普通价格冒充 Fast 费用。
+ChatGPT 订阅的 Fast credit 倍率与这里的 API 等价美元金额是不同口径，不叠乘。
+
+S2A 和 Cockpit Tools 优先保留来源的逐请求费用快照，Fast 不重复加价。Astra
+长上下文校正也以该请求的服务等级为基准，保留 Fast 的价格差。升级后 S2A
+在配置的回填窗口内（默认 30 天）重读记录，Cockpit 重读保留的请求记录；
+按既有导入键更新等级，不增加重复请求，也不恢复已按隐私策略删除的账号明细。
+
+`/usage` 增加“服务等级与费率”近 7 天明细，分别显示模型、模式、上下文、
+调用数、输入/缓存/输出有效单价和成本。最近请求显示各自模式，顶部单价标为
+“累计平均”。未知模式、已匿名化记录和缺少价格的请求保持可区分。
 
 也可以显式维护本地价格：
 
@@ -645,7 +668,7 @@ tmux new-session -s cliproxy_usage_meter_test \
 
 1. streaming upstream 不提供最终 usage 时只能记录 `usage_missing=1`；不会猜 token。
 2. alias/account 自动映射依赖 bearer 与本地 auth 相同，或客户端显式提供 `X-Usage-Alias`；共享代理 key 无法自动拆分。
-3. 官方价格同步解析 Standard 短/长上下文及 cache-write 费率；官方未列出的代理别名仍保持 `NULL`，
+3. 官方价格同步解析 Standard/Fast 短/长上下文及 cache-write 费率；官方未列出的代理别名仍保持 `NULL`，
    不做推断。usage 未提供 `cache_write_tokens` 时无法单独展示写入 token，但不影响已上报
    input/cached/output 的长上下文阈值判断。建议定期显式运行 `--sync-official-prices`。
 4. quota 等价额度只有观察到完整 quota/cooldown 事件才会封存；当前周期只提供 observed floor。

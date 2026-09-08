@@ -59,7 +59,14 @@ DEFAULT_UPSTREAM = "http://127.0.0.1:8317"
 DEFAULT_DB = PROJECT_ROOT / "datas" / "cliproxy_usage.sqlite"
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 OFFICIAL_PRICING_HOSTS = {"developers.openai.com", "platform.openai.com"}
-OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v4-astra-flat-context"
+OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v5-service-tiers"
+PRICE_RATE_FIELDS = (
+    "input_per_million", "cached_input_per_million", "cache_write_per_million",
+    "output_per_million", "long_context_threshold_tokens",
+    "long_input_per_million", "long_cached_input_per_million",
+    "long_cache_write_per_million", "long_output_per_million",
+)
+TIER_SOURCES = frozenset({"response", "request", "upstream", "local"})
 LONG_CONTEXT_THRESHOLD_TOKENS = 272_000
 DEFAULT_USAGE_QUEUE_PATH = "/v0/management/usage-queue"
 DEFAULT_USAGE_QUEUE_COUNT = 100
@@ -630,6 +637,27 @@ def extract_error(body: bytes, status_code: int) -> tuple[str | None, str | None
     return redact_text(error_type, 120) or f"http_{status_code}", redact_text(message)
 
 
+def normalize_service_tier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    tier = value.strip().lower()
+    if tier in {"fast", "priority"}:
+        return "fast"
+    if tier in {"default", "standard"}:
+        return "default"
+    return tier if tier in {"auto", "flex", "scale"} else None
+
+
+def response_service_tier(value: Any) -> str | None:
+    """Read response metadata only, never user content or tool arguments."""
+    if not isinstance(value, Mapping):
+        return None
+    response = value.get("response")
+    if isinstance(response, Mapping):
+        return normalize_service_tier(response.get("service_tier"))
+    return normalize_service_tier(value.get("service_tier"))
+
+
 class SSEInspector:
     """Incrementally inspect SSE data without delaying or rewriting the stream."""
 
@@ -639,6 +667,7 @@ class SSEInspector:
         self._event_size = 0
         self.usage = NormalizedUsage()
         self.model: str | None = None
+        self.service_tier: str | None = None
 
     def feed(self, data: bytes) -> None:
         self._buffer.extend(data)
@@ -688,6 +717,7 @@ class SSEInspector:
         if not usage.missing:
             self.usage = usage
         self.model = find_model(parsed) or self.model
+        self.service_tier = response_service_tier(parsed) or self.service_tier
 
 
 @dataclass(frozen=True)
@@ -2352,6 +2382,7 @@ class RequestInfo:
     account_id_hash: str | None
     account_id_tail: str | None
     identity_key: str
+    requested_service_tier: str | None = None
 
 
 def request_info(
@@ -2398,6 +2429,7 @@ def request_info(
         account_id_hash=identity.account_id_hash,
         account_id_tail=identity.account_id_tail,
         identity_key=key,
+        requested_service_tier=normalize_service_tier(payload.get("service_tier")),
     )
 
 
@@ -2447,6 +2479,9 @@ class UsageEvent:
     # selected. Keep them in usage history without treating them as an
     # upstream API response, account-pool attempt, or availability signal.
     account_attempt: int = 1
+    service_tier: str | None = None
+    requested_service_tier: str | None = None
+    service_tier_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2768,6 +2803,11 @@ class UsageRepository:
                   completed_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS service_tier_backfills (
+                  source TEXT PRIMARY KEY,
+                  completed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS anonymous_usage_daily (
                   bucket_start TEXT NOT NULL,
                   model TEXT NOT NULL,
@@ -2828,6 +2868,11 @@ class UsageRepository:
             self._ensure_column(conn, "usage_events", "identity_key", "TEXT")
             self._ensure_column(conn, "usage_events", "source", "TEXT DEFAULT 'sidecar'")
             self._ensure_column(conn, "usage_events", "request_id", "TEXT")
+            for field in ("service_tier", "requested_service_tier", "service_tier_source"):
+                self._ensure_column(conn, "usage_events", field, "TEXT")
+            self._ensure_column(conn, "local_import_files", "service_tier", "TEXT")
+            for field in PRICE_RATE_FIELDS:
+                self._ensure_column(conn, "model_prices", "fast_" + field, "REAL")
             # Very old databases did not persist the HTTP status.  Add the
             # nullable column before the Cockpit classification backfill
             # below; otherwise that migration would fail while inspecting an
@@ -3123,7 +3168,8 @@ class UsageRepository:
                        MAX(COALESCE(input_tokens, 0)
                            - COALESCE(cached_tokens, 0), 0)
                          + COALESCE(output_tokens, 0)
-                         AS codex_status_token_count
+                         AS codex_status_token_count,
+                       service_tier, requested_service_tier, service_tier_source
                   FROM usage_events
                 UNION ALL
                 SELECT -rowid, bucket_start, NULL, NULL, NULL,
@@ -3137,7 +3183,8 @@ class UsageRepository:
                        NULL, NULL, usage_missing, NULL, NULL, 0, 0,
                        calls, 'anonymous', NULL, account_attempts,
                        streaming_calls,
-                       non_cached_input_tokens, codex_status_tokens
+                       non_cached_input_tokens, codex_status_tokens,
+                       NULL, NULL, NULL
                   FROM anonymous_usage_daily;
                 """
             )
@@ -3165,6 +3212,7 @@ class UsageRepository:
     def _components_for_price(
         usage: NormalizedUsage,
         price: Mapping[str, Any] | None,
+        service_tier: str | None = None,
     ) -> PriceComponents | None:
         if price is None or usage.missing:
             return None
@@ -3173,6 +3221,11 @@ class UsageRepository:
         if usage.input_tokens is None or usage.output_tokens is None:
             return None
         price = dict(price)
+        tier = normalize_service_tier(service_tier)
+        if tier == "fast":
+            price.update({field: price.get("fast_" + field) for field in PRICE_RATE_FIELDS})
+        elif tier not in {None, "default", "auto"}:
+            return None
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         cached_tokens = usage.cached_tokens or 0
@@ -3250,6 +3303,7 @@ class UsageRepository:
         self,
         model: str | None,
         usage: NormalizedUsage,
+        service_tier: str | None = None,
     ) -> PriceComponents | None:
         if not model or usage.missing:
             return None
@@ -3258,10 +3312,10 @@ class UsageRepository:
                 "SELECT * FROM model_prices WHERE currency = 'USD' OR currency IS NULL"
             ).fetchall()
         price = self._matched_price(model, rows)
-        return self._components_for_price(usage, price)
+        return self._components_for_price(usage, price, service_tier)
 
-    def price_for(self, model: str | None, usage: NormalizedUsage) -> float | None:
-        components = self.price_components_for(model, usage)
+    def price_for(self, model: str | None, usage: NormalizedUsage, service_tier: str | None = None) -> float | None:
+        components = self.price_components_for(model, usage, service_tier)
         return components.total_cost_usd if components is not None else None
 
     @staticmethod
@@ -3296,6 +3350,7 @@ class UsageRepository:
         model: str | None,
         usage: NormalizedUsage,
         components: PriceComponents | None,
+        service_tier: str | None = None,
     ) -> PriceComponents | None:
         if (
             model != "gpt-6-astra"
@@ -3305,7 +3360,7 @@ class UsageRepository:
         ):
             return components
         return self._verified_astra_context_components(
-            components, self.price_components_for(model, usage)
+            components, self.price_components_for(model, usage, service_tier)
         )
 
     def _correct_astra_context_costs(self, conn: sqlite3.Connection) -> int:
@@ -3334,7 +3389,7 @@ class UsageRepository:
         events = conn.execute(
             """SELECT id, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
                       estimated_api_cost_usd, non_cached_input_cost_usd,
-                      cached_input_cost_usd, output_cost_usd
+                      cached_input_cost_usd, output_cost_usd, service_tier
                  FROM usage_events
                 WHERE model='gpt-6-astra' AND long_context_pricing_applied=1
                   AND input_tokens>? AND output_tokens IS NOT NULL
@@ -3361,7 +3416,7 @@ class UsageRepository:
             ):
                 continue
             corrected = self._verified_astra_context_components(
-                frozen, self._components_for_price(usage, price)
+                frozen, self._components_for_price(usage, price, event["service_tier"])
             )
             if corrected is frozen:
                 continue
@@ -3393,7 +3448,7 @@ class UsageRepository:
         events = conn.execute(
             """
             SELECT id, model, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
-                   estimated_api_cost_usd
+                   estimated_api_cost_usd, service_tier
               FROM usage_events
              WHERE estimated_api_cost_usd IS NOT NULL
                AND input_tokens IS NOT NULL
@@ -3414,6 +3469,7 @@ class UsageRepository:
             components = self._components_for_price(
                 usage,
                 self._matched_price(event["model"], prices),
+                event["service_tier"],
             )
             if components is None:
                 continue
@@ -3475,7 +3531,7 @@ class UsageRepository:
             """
             SELECT id, model, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
                    estimated_api_cost_usd, non_cached_input_cost_usd,
-                   cached_input_cost_usd, output_cost_usd
+                   cached_input_cost_usd, output_cost_usd, service_tier
               FROM usage_events
              WHERE COALESCE(long_context_pricing_applied, 0)=0
                AND input_tokens IS NOT NULL
@@ -3503,8 +3559,9 @@ class UsageRepository:
             )
             short_price = dict(price)
             short_price["long_context_threshold_tokens"] = None
-            short_components = self._components_for_price(usage, short_price)
-            long_components = self._components_for_price(usage, price)
+            short_price["fast_long_context_threshold_tokens"] = None
+            short_components = self._components_for_price(usage, short_price, event["service_tier"])
+            long_components = self._components_for_price(usage, price, event["service_tier"])
             if short_components is None or long_components is None:
                 continue
             frozen = (
@@ -4599,8 +4656,8 @@ class UsageRepository:
                     conn.execute(
                         """INSERT OR REPLACE INTO local_import_files
                            (path, size, mtime_ns, offset, session_id,
-                            model_provider, model, turn_id, updated_at)
-                           VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, ?)""",
+                            model_provider, model, turn_id, updated_at, service_tier)
+                           VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?)""",
                         (
                             path_key,
                             row["size"],
@@ -4614,6 +4671,7 @@ class UsageRepository:
                             ),
                             safe_model_identifier(row["model"]),
                             row["updated_at"],
+                            normalize_service_tier(row["service_tier"]),
                         ),
                     )
         self._checkpoint_privacy_wal("privacy minimization")
@@ -4656,6 +4714,11 @@ class UsageRepository:
                   updated_at=excluded.updated_at
                 """,
                 (pattern, input_rate, output_rate, cached_rate, redact_text(source_note, 500), utc_now()),
+            )
+            conn.execute(
+                "UPDATE model_prices SET "
+                + ", ".join(f"fast_{field}=NULL" for field in PRICE_RATE_FIELDS)
+                + " WHERE model_pattern=?", (pattern,),
             )
 
     def list_prices(self) -> list[dict[str, Any]]:
@@ -4744,7 +4807,7 @@ class UsageRepository:
             raise ValueError("official pricing parser returned an invalid model name")
         note = (
             f"official OpenAI pricing; URL={source_url}; fetched_at={fetched_at}; "
-            f"sha256={content_sha256}; parser={parser_version}; standard short/long-context rates"
+            f"sha256={content_sha256}; parser={parser_version}; Standard and Fast API rates"
         )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -4791,9 +4854,17 @@ class UsageRepository:
                         fetched_at,
                     ),
                 )
+                conn.execute(
+                    "UPDATE model_prices SET "
+                    + ", ".join(f"fast_{field}=?" for field in PRICE_RATE_FIELDS)
+                    + " WHERE model_pattern=?",
+                    tuple(row.get("fast_" + field) for field in PRICE_RATE_FIELDS)
+                    + (row["model_pattern"],),
+                )
                 unpriced = conn.execute(
                     """
-                    SELECT id, input_tokens, cached_tokens, cache_write_tokens, output_tokens
+                    SELECT id, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
+                           service_tier
                       FROM usage_events
                      WHERE estimated_api_cost_usd IS NULL
                        AND non_cached_input_cost_usd IS NULL
@@ -4812,7 +4883,7 @@ class UsageRepository:
                         cached_tokens=as_nonnegative_int(event["cached_tokens"]),
                         cache_write_tokens=as_nonnegative_int(event["cache_write_tokens"]),
                     )
-                    components = self._components_for_price(usage, row)
+                    components = self._components_for_price(usage, row, event["service_tier"])
                     if components is None:
                         continue
                     cursor = conn.execute(
@@ -5011,6 +5082,11 @@ class UsageRepository:
         ):
             values[field] = None
         values["model"] = safe_model_identifier(event.model)
+        values["service_tier"] = normalize_service_tier(event.service_tier)
+        values["requested_service_tier"] = normalize_service_tier(event.requested_service_tier)
+        values["service_tier_source"] = (
+            event.service_tier_source if event.service_tier_source in TIER_SOURCES else None
+        )
         values["source"] = safe_alias(event.source) or "unknown"
         values["account_attempt"] = int(
             (as_nonnegative_int(event.account_attempt) or 0) > 0
@@ -5775,6 +5851,21 @@ class UsageRepository:
             ).fetchone()
         return row is None or int(row["version"] or 0) < int(version)
 
+    def service_tier_backfill_required(self, source: str) -> bool:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM service_tier_backfills WHERE source=?", (source,),
+            ).fetchone() is None
+
+    def mark_service_tier_backfill(self, source: str) -> None:
+        if source not in RESPONSE_TIMELINE_SOURCES:
+            raise ValueError("invalid service tier source")
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO service_tier_backfills VALUES (?, ?)",
+                (source, utc_now()),
+            )
+
     def mark_api_response_backfill(
         self,
         source: str,
@@ -5846,6 +5937,7 @@ class UsageRepository:
                 else None
             ),
             "model": safe_model_identifier(state.get("model")),
+            "service_tier": normalize_service_tier(state.get("service_tier")),
             "turn_id": None,
             "updated_at": utc_now(),
         }
@@ -5855,14 +5947,15 @@ class UsageRepository:
             conn.execute(
                 """INSERT INTO local_import_files
                    (path, size, mtime_ns, offset, session_id, model_provider,
-                    model, turn_id, updated_at)
+                    model, turn_id, updated_at, service_tier)
                    VALUES (:path, :size, :mtime_ns, :offset, :session_id,
-                           :model_provider, :model, :turn_id, :updated_at)
+                           :model_provider, :model, :turn_id, :updated_at, :service_tier)
                    ON CONFLICT(path) DO UPDATE SET
                      size=excluded.size, mtime_ns=excluded.mtime_ns,
                      offset=excluded.offset, session_id=excluded.session_id,
                      model_provider=excluded.model_provider, model=excluded.model,
-                     turn_id=excluded.turn_id, updated_at=excluded.updated_at""",
+                     turn_id=excluded.turn_id, updated_at=excluded.updated_at,
+                     service_tier=excluded.service_tier""",
                 values,
             )
 
@@ -6277,6 +6370,34 @@ class UsageRepository:
         result["period"] = period
         result["since"] = None if str(period).strip().lower() in ALL_TIME_PERIODS else start
         return result
+
+    def service_tier_breakdown(self, period: str = "7d") -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                """SELECT model, service_tier,
+                          CASE WHEN service_tier_source IN ('request', 'local')
+                               THEN service_tier_source END AS service_tier_source,
+                          COALESCE(long_context_pricing_applied, 0) AS long_context_pricing_applied,
+                          SUM(call_count) AS calls,
+                          SUM(CASE WHEN estimated_api_cost_usd IS NULL THEN call_count ELSE 0 END) AS unpriced_calls,
+                          SUM(CASE WHEN non_cached_input_cost_usd IS NOT NULL
+                                   THEN non_cached_input_token_count END) AS priced_input_tokens,
+                          SUM(CASE WHEN cached_input_cost_usd IS NOT NULL THEN cached_tokens END) AS priced_cached_tokens,
+                          SUM(CASE WHEN output_cost_usd IS NOT NULL THEN output_tokens END) AS priced_output_tokens,
+                          SUM(non_cached_input_cost_usd) AS non_cached_input_cost_usd,
+                          SUM(cached_input_cost_usd) AS cached_input_cost_usd,
+                          SUM(output_cost_usd) AS output_cost_usd,
+                          SUM(estimated_api_cost_usd) AS estimated_api_cost_usd
+                     FROM usage_statistics
+                    WHERE ts>=? AND account_attempt_count>0
+                    GROUP BY model, service_tier,
+                             CASE WHEN service_tier_source IN ('request', 'local')
+                                  THEN service_tier_source END,
+                             COALESCE(long_context_pricing_applied, 0)
+                    ORDER BY model, service_tier, service_tier_source,
+                             long_context_pricing_applied""",
+                (period_start(period),),
+            )]
 
     def cost_breakdown(self, period: str) -> dict[str, Any]:
         """Return the immutable per-event cost split from one SQLite snapshot."""
@@ -7690,7 +7811,88 @@ def _parse_grouped_context_pricing_rows(fragment: str) -> list[dict[str, Any]]:
     return list(parsed.values())
 
 
+class _PricingPaneParser(HTMLParser):
+    """Keep service-tier panes separate, including their full SSR props."""
+
+    VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img",
+                           "input", "link", "meta", "param", "source", "track", "wbr"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.panes: dict[str, list[str]] = {}
+        self._tier: str | None = None
+        self._depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if self._tier is None and attributes.get("data-content-switcher-pane") == "true":
+            self._tier = attributes.get("data-value") or "unknown"
+            self.panes.setdefault(self._tier, [])
+        if self._tier is not None:
+            self.panes[self._tier].append(self.get_starttag_text())
+            if tag not in self.VOID_TAGS:
+                self._depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._tier is not None:
+            self.panes[self._tier].append(f"</{tag}>")
+            if tag not in self.VOID_TAGS:
+                self._depth -= 1
+            if self._depth == 0:
+                self._tier = None
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._tier is not None:
+            self.panes[self._tier].append(self.get_starttag_text())
+
+    def handle_data(self, data: str) -> None:
+        if self._tier is not None:
+            self.panes[self._tier].append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.handle_data(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.handle_data(f"&#{name};")
+
+
 def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
+    if isinstance(document, bytes):
+        try:
+            document = document.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OfficialPriceSyncError("pricing page is not UTF-8 HTML") from exc
+    if not document or len(document) > 20 * 1024 * 1024:
+        raise OfficialPriceSyncError("pricing page is empty or too large")
+    parser = _PricingPaneParser()
+    parser.feed(document)
+    parser.close()
+    standard = "".join(parser.panes.get("standard", []))
+    rows = _parse_pricing_table_html(standard or document)
+    fast = "".join(parser.panes.get("fast", []) or parser.panes.get("priority", []))
+    if fast:
+        fast_rows = _parse_pricing_table_html(fast, complete_context=False)
+        by_model = {row["model_pattern"]: row for row in rows}
+        for fast_row in fast_rows:
+            model = fast_row["model_pattern"]
+            if model not in by_model:
+                continue
+            if model in {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} and not fast_row.get("long_context_threshold_tokens"):
+                fast_row = _complete_context_tiers([fast_row])[0]
+            if model == "gpt-6-astra":
+                # Preserve the meter's Astra flat-context policy for both speeds.
+                for field in PRICE_RATE_FIELDS:
+                    if field.startswith("long_"):
+                        fast_row[field] = None
+            elif model in {"gpt-5.4", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}:
+                fast_row["long_context_threshold_tokens"] = LONG_CONTEXT_THRESHOLD_TOKENS
+            by_model[model].update({"fast_" + field: fast_row.get(field) for field in PRICE_RATE_FIELDS})
+    return rows
+
+
+def _parse_pricing_table_html(
+    document: str | bytes, *, complete_context: bool = True,
+) -> list[dict[str, Any]]:
     """Parse Standard short- and long-context prices from the official page.
 
     Returned prices are USD per million tokens.  The sidecar does not infer a
@@ -7733,9 +7935,10 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
         for grouped_row in grouped_rows:
             model = grouped_row["model_pattern"]
             by_model[model] = grouped_row
-        return _complete_context_tiers(list(by_model.values()))
+        result = list(by_model.values())
+        return _complete_context_tiers(result) if complete_context else result
     if props_rows:
-        return _complete_context_tiers(props_rows)
+        return _complete_context_tiers(props_rows) if complete_context else props_rows
 
     parser = _PricingHTMLParser()
     try:
@@ -7765,6 +7968,7 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
         model_index = 0
     input_indexes = [index for index, value in enumerate(header) if value == "input"]
     cached_indexes = [index for index, value in enumerate(header) if value.startswith("cached input")]
+    write_indexes = [index for index, value in enumerate(header) if value in {"cache writes", "cache write"}]
     output_indexes = [index for index, value in enumerate(header) if value == "output"]
     input_index = input_indexes[0] if input_indexes else 1
     cached_index = cached_indexes[0] if cached_indexes else 2
@@ -7796,11 +8000,16 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
                 "input_per_million": input_rate,
                 "output_per_million": output_rate,
                 "cached_input_per_million": cached_rate,
+                "cache_write_per_million": (
+                    _pricing_number(row[write_indexes[0]])
+                    if write_indexes and write_indexes[0] < len(row) else None
+                ),
             },
         )
     if not parsed:
         raise OfficialPriceSyncError("standard pricing table contained no usable model rows")
-    return _complete_context_tiers(list(parsed.values()))
+    result = list(parsed.values())
+    return _complete_context_tiers(result) if complete_context else result
 
 
 def _validate_official_url(url: str) -> str:
@@ -7984,7 +8193,8 @@ def queue_record_event(
     status_value = as_nonnegative_int(fail_block.get("status_code"))
     status_code = status_value if status_value and status_value >= 100 else (500 if failed else 200)
     error_message = redact_text(fail_block.get("body")) if failed else None
-    components = repo.price_components_for(model, usage)
+    service_tier = response_service_tier(record)
+    components = repo.price_components_for(model, usage, service_tier)
     event = UsageEvent(
         ts=normalize_timestamp(record.get("timestamp")),
         identity_key=key,
@@ -8029,6 +8239,8 @@ def queue_record_event(
         response_bytes=0,
         source="usage_queue",
         request_id=None,
+        service_tier=service_tier,
+        service_tier_source="upstream" if service_tier else None,
     )
     return event, info
 
@@ -8432,7 +8644,8 @@ class CockpitToolsImporter:
             else (200 if success else 500)
         )
         model = safe_model_identifier(row.get("model_id"))
-        components = self.repo.correct_astra_context_components(model, usage, components)
+        service_tier = normalize_service_tier(row.get("service_tier"))
+        components = self.repo.correct_astra_context_components(model, usage, components, service_tier)
         total_only_snapshot = self._safe_rate(row.get("estimated_cost_usd"))
         if total_only_snapshot is not None and total_only_snapshot <= 0:
             total_only_snapshot = None
@@ -8486,6 +8699,8 @@ class CockpitToolsImporter:
             response_bytes=0,
             source=COCKPIT_TOOLS_REQUEST_SOURCE,
             request_id=None,
+            service_tier=service_tier,
+            service_tier_source="upstream" if service_tier else None,
             # An empty Cockpit selector means its gateway rejected the client
             # before choosing a subscription. Preserve the request history,
             # but do not let it masquerade as an upstream response or
@@ -8602,14 +8817,17 @@ class CockpitToolsImporter:
             response_backfill = self.repo.api_response_backfill_required(
                 COCKPIT_TOOLS_REQUEST_SOURCE
             )
+            tier_backfill = self.repo.service_tier_backfill_required(COCKPIT_TOOLS_REQUEST_SOURCE)
             if max_id < cursor_id or (state and max_version != previous_version):
                 cursor_id = 0
-            if response_backfill:
+            if response_backfill or tier_backfill:
                 # Versioned, idempotent replay restores the minute/status
                 # observations for historical request rows whose account-level
                 # usage detail was already removed by privacy retirement.
                 cursor_id = 0
             columns = ", ".join(self.REQUIRED_REQUEST_COLUMNS)
+            if "service_tier" in available_columns:
+                columns += ", service_tier"
             rows = connection.execute(
                 f"SELECT {columns} FROM request_logs WHERE id>? AND id<=? ORDER BY id",
                 (cursor_id, max_id),
@@ -8643,6 +8861,8 @@ class CockpitToolsImporter:
         )
         if response_backfill:
             self.repo.mark_api_response_backfill(COCKPIT_TOOLS_REQUEST_SOURCE)
+        if tier_backfill:
+            self.repo.mark_service_tier_backfill(COCKPIT_TOOLS_REQUEST_SOURCE)
         return {
             "imported": imported,
             "scanned": scanned,
@@ -9220,6 +9440,7 @@ class Sub2APIImporter:
                 estimated_cost = component_total
 
         model = safe_model_identifier(record.get("model"))
+        service_tier = normalize_service_tier(record.get("service_tier"))
         long_context = bool(record.get("long_context_billing_applied"))
         if non_cached_cost is not None and cached_cost is not None and output_cost is not None:
             components = self.repo.correct_astra_context_components(
@@ -9229,6 +9450,7 @@ class Sub2APIImporter:
                     cached_tokens=cached_tokens, cache_write_tokens=cache_write_tokens,
                 ),
                 PriceComponents(non_cached_cost, cached_cost, output_cost, long_context),
+                service_tier,
             )
             assert components is not None
             non_cached_cost = components.non_cached_input_cost_usd
@@ -9280,6 +9502,8 @@ class Sub2APIImporter:
             response_bytes=0,
             source=SUB2API_REQUEST_SOURCE,
             request_id=None,
+            service_tier=service_tier,
+            service_tier_source="upstream" if service_tier else None,
             account_attempt=int(record.get("account_id") is not None),
         )
         return event, import_key
@@ -9288,7 +9512,7 @@ class Sub2APIImporter:
         state = self.repo.remote_import_state(SUB2API_REQUEST_SOURCE) or {}
         last_complete = normalize_optional_timestamp(state.get("last_complete_at"))
         start = now - timedelta(days=self.backfill_days)
-        if last_complete:
+        if last_complete and not self.repo.service_tier_backfill_required(SUB2API_REQUEST_SOURCE):
             try:
                 parsed = datetime.fromisoformat(last_complete.replace("Z", "+00:00"))
             except ValueError:
@@ -9296,6 +9520,17 @@ class Sub2APIImporter:
             if parsed is not None:
                 start = parsed.astimezone(timezone.utc) - timedelta(days=1)
         return start.date().isoformat(), now.date().isoformat()
+
+    def _usage_ranges(self, now: datetime) -> list[tuple[str, str]]:
+        start, end = self._usage_range(now)
+        if (
+            self.repo.service_tier_backfill_required(SUB2API_REQUEST_SOURCE)
+            and self.repo.remote_import_state(SUB2API_REQUEST_SOURCE)
+        ):
+            # Keep completed dates stable while new requests enter today's log.
+            yesterday = (now - timedelta(days=1)).date().isoformat()
+            return [(start, yesterday), (end, end)]
+        return [(start, end)]
 
     def import_once(self, key: str | None = None) -> dict[str, Any]:
         loaded_key = key or self._load_key()
@@ -9315,19 +9550,20 @@ class Sub2APIImporter:
         )
         quota_rows = self._import_account_snapshots(accounts)
 
-        start_date, end_date = self._usage_range(scan_started)
-        usage_records = self._paginated(
-            "/admin/usage",
-            loaded_key,
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-                "timezone": "UTC",
-                "sort_by": "id",
-                "sort_order": "asc",
-                "exact_total": "true",
-            },
-        )
+        usage_records: list[Mapping[str, Any]] = []
+        for start_date, end_date in self._usage_ranges(scan_started):
+            usage_records.extend(self._paginated(
+                "/admin/usage",
+                loaded_key,
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "timezone": "UTC",
+                    "sort_by": "id",
+                    "sort_order": "asc",
+                    "exact_total": "true",
+                },
+            ))
         converted_events: list[tuple[UsageEvent, str]] = []
         for record in usage_records:
             converted = self._event_from_record(record)
@@ -9342,6 +9578,8 @@ class Sub2APIImporter:
             SUB2API_REQUEST_SOURCE,
             scan_started,
         )
+        if self.repo.service_tier_backfill_required(SUB2API_REQUEST_SOURCE):
+            self.repo.mark_service_tier_backfill(SUB2API_REQUEST_SOURCE)
         return {
             "imported": sync_result["new"],
             "scanned": len(usage_records),
@@ -9897,6 +10135,7 @@ class CodexAppLocalImporter:
         )
         model_provider: str | None = None
         model: str | None = None
+        service_tier: str | None = None
         events: list[tuple[UsageEvent, str]] = []
         quota_snapshots: list[dict[str, Any]] = []
         record_index = 0
@@ -9921,6 +10160,7 @@ class CodexAppLocalImporter:
             if can_resume:
                 model_provider = safe_text(state.get("model_provider"), 64)
                 model = safe_text(state.get("model"), 200)
+                service_tier = normalize_service_tier(state.get("service_tier"))
             handle = path.open("r", encoding="utf-8", errors="replace")
             if start_offset:
                 handle.seek(start_offset)
@@ -9943,6 +10183,7 @@ class CodexAppLocalImporter:
                     continue
                 if record_type == "turn_context":
                     model = safe_model_identifier(payload.get("model")) or model
+                    service_tier = normalize_service_tier(payload.get("service_tier"))
                     continue
                 if record_type == "event_msg" and payload.get("type") == "task_started":
                     continue
@@ -9955,7 +10196,8 @@ class CodexAppLocalImporter:
                 if usage.missing:
                     continue
                 timestamp = normalize_timestamp(record.get("timestamp"))
-                components = self.repo.price_components_for(model, usage)
+                event_tier = response_service_tier(payload) or service_tier
+                components = self.repo.price_components_for(model, usage, event_tier)
                 ordinal = record.get("ordinal")
                 ordinal_key = (
                     str(ordinal) if ordinal is not None else f"line-{record_index}"
@@ -10023,6 +10265,8 @@ class CodexAppLocalImporter:
                             response_bytes=0,
                             source="codex_app_local",
                             request_id=None,
+                            service_tier=event_tier,
+                            service_tier_source="local" if event_tier else None,
                         ),
                         import_key,
                     )
@@ -10059,6 +10303,7 @@ class CodexAppLocalImporter:
                 "offset": min(final_offset, final_stat.st_size),
                 "model_provider": model_provider,
                 "model": model,
+                "service_tier": service_tier,
             },
             events,
             quota_snapshots,
@@ -10680,6 +10925,27 @@ def fmt_rate_per_million(cost: Any, tokens: Any) -> str:
     return f"${rate:,.4f}/M" if abs(rate) < 0.1 else f"${rate:,.2f}/M"
 
 
+def service_tier_label(row: Mapping[str, Any]) -> str:
+    tier = normalize_service_tier(row.get("service_tier"))
+    if tier in {None, "auto"}:
+        return "模式未知"
+    label = {"fast": "Fast", "default": "Standard", "flex": "Flex", "scale": "Scale"}[tier]
+    source = row.get("service_tier_source")
+    if source == "request":
+        label += "（请求估算）"
+    elif source == "local":
+        label += "（本地估算）"
+    elif tier == "default" and row.get("requested_service_tier") == "fast":
+        label += "（Fast 已降级）"
+    return label
+
+
+def context_price_label(row: Mapping[str, Any]) -> str:
+    if row.get("model") == "gpt-6-astra" and not row.get("long_context_pricing_applied"):
+        return "上下文统一"
+    return "长上下文" if row.get("long_context_pricing_applied") else "短上下文"
+
+
 def fmt_int(value: Any) -> str:
     return f"{int(value or 0):,}"
 
@@ -11251,6 +11517,7 @@ def dashboard_html(
     subscriptions = repo.subscription_dashboard_rows()
     persisted_quota_accounts = sum(1 for row in subscriptions if row.get("windows"))
     models = repo.grouped("7d", "model")
+    tier_groups = repo.service_tier_breakdown("7d")
     recent = repo.recent_account_attempts(50)
     if account_resolver is not None:
         for row in [*subscriptions, *recent]:
@@ -11275,7 +11542,7 @@ def dashboard_html(
                 "非缓存输入 Tokens",
                 fmt_compact(all_time["non_cached_input_tokens"]),
                 f"输入成本 {fmt_money(all_time['non_cached_input_cost_usd'])} · "
-                f"有效 {fmt_rate_per_million(all_time['non_cached_input_cost_usd'], all_time['non_cached_input_tokens'])} · "
+                f"累计平均 {fmt_rate_per_million(all_time['non_cached_input_cost_usd'], all_time['non_cached_input_tokens'])} · "
                 f"{fmt_int(all_time['non_cached_input_tokens'])}",
                 "cyan-card",
             ),
@@ -11283,7 +11550,7 @@ def dashboard_html(
                 "输出 Tokens",
                 fmt_compact(all_time["output_tokens"]),
                 f"输出成本 {fmt_money(all_time['output_cost_usd'])} · "
-                f"有效 {fmt_rate_per_million(all_time['output_cost_usd'], all_time['output_tokens'])} · "
+                f"累计平均 {fmt_rate_per_million(all_time['output_cost_usd'], all_time['output_tokens'])} · "
                 f"{fmt_int(all_time['output_tokens'])}",
                 "output-card",
             ),
@@ -11291,7 +11558,7 @@ def dashboard_html(
                 "缓存命中 Tokens",
                 fmt_compact(all_time["cached_tokens"]),
                 f"缓存成本 {fmt_money(all_time['cached_input_cost_usd'])} · "
-                f"有效 {fmt_rate_per_million(all_time['cached_input_cost_usd'], all_time['cached_tokens'])} · "
+                f"累计平均 {fmt_rate_per_million(all_time['cached_input_cost_usd'], all_time['cached_tokens'])} · "
                 f"命中率 {fmt_percent(all_time['cache_hit_rate_percent'])}",
                 "mint-card",
             ),
@@ -11508,13 +11775,25 @@ def dashboard_html(
         f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
-        f'<td>{"统一费率" if row.get("model") == "gpt-6-astra" else ("长上下文" if row.get("long_context_pricing_applied") else "短上下文")}</td>'
+        f'<td>{html.escape(service_tier_label(row))} · {context_price_label(row)}</td>'
         f'<td>{fmt_money(row["non_cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["output_cost_usd"])}</td>'
         f'<td>{fmt_money(row["cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["estimated_api_cost_usd"])}</td></tr>'
         for row in recent
     ) or '<tr><td colspan="12" class="empty">暂无数据</td></tr>'
+
+    tier_rows = "".join(
+        f'<tr><td>{html.escape(row["model"] or "未知模型")}</td>'
+        f'<td>{html.escape(service_tier_label(row))}</td>'
+        f'<td>{context_price_label(row)}</td><td>{fmt_int(row["calls"])}</td>'
+        f'<td>{fmt_rate_per_million(row["non_cached_input_cost_usd"], row["priced_input_tokens"])}</td>'
+        f'<td>{fmt_rate_per_million(row["cached_input_cost_usd"], row["priced_cached_tokens"])}</td>'
+        f'<td>{fmt_rate_per_million(row["output_cost_usd"], row["priced_output_tokens"])}</td>'
+        f'<td>{fmt_money(row["estimated_api_cost_usd"])}</td>'
+        f'<td>{fmt_int(row["unpriced_calls"])}</td></tr>'
+        for row in tier_groups
+    ) or '<tr><td colspan="9" class="empty">暂无数据</td></tr>'
 
     session_notice = (
         '<div class="notice warning-notice"><b>会话关联已按隐私策略关闭</b>'
@@ -11695,6 +11974,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="notice"><b>按模型计费</b><span>gpt-6-astra 长短上下文统一费率，不加收长上下文费用。其他具有长上下文价格档的模型，按每次调用完整 input tokens 判断：≤272K 使用短档，&gt;272K 使用长档；cached tokens 计入输入阈值，并按对应缓存单价计费。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
 <section class="period-grid">{period_cards}</section>
+<section class="panel" data-role="service-tier-costs"><h3>服务等级与费率 · 近 7 天</h3><p class="table-note">API 等价成本 · 按模型、模式和上下文分别统计；费率为各组已计价请求的平均值。模式未知表示原始记录未提供服务等级，本地估价沿用 Standard。Fast 请求估算尚未获得响应等级确认。ChatGPT 订阅额度倍率不计入美元成本。</p><div class="table-wrap"><table><thead><tr><th>模型</th><th>模式</th><th>上下文计费</th><th>请求数</th><th>非缓存输入费率</th><th>缓存输入费率</th><th>输出费率</th><th>API 等价成本</th><th>未计价请求</th></tr></thead><tbody>{tier_rows}</tbody></table></div></section>
 {response_timeline_chart}
 <div class="section-title"><div><h2>近 7 天趋势</h2><p>柱高为非缓存输入 + 输出；悬停可看缓存和 API 原始处理量。</p></div></div>
 <section class="panel trend-panel"><div class="trend">{trend_bars}</div></section>
@@ -12248,8 +12528,9 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 self._proxy_stream(upstream_response, info, len(body), started)
             else:
                 response_body = b"" if self.command == "HEAD" else upstream_response.read()
-                usage = find_usage(parse_json_bytes(response_body))
-                model = info.model or find_model(parse_json_bytes(response_body))
+                response_payload = parse_json_bytes(response_body)
+                usage = find_usage(response_payload)
+                model = info.model or find_model(response_payload)
                 error_type, error_message = extract_error(response_body, upstream_response.status)
                 response_started = True
                 self._send_upstream_bytes(upstream_response, response_body)
@@ -12263,6 +12544,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     len(body),
                     len(response_body),
                     started,
+                    response_tier=response_service_tier(response_payload),
                 )
                 self._record_event(event, info)
         except (BrokenPipeError, ConnectionResetError) as exc:
@@ -12368,6 +12650,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             if not fallback_usage.missing:
                 inspector.usage = fallback_usage
                 inspector.model = inspector.model or find_model(parse_json_bytes(bytes(body_capture)))
+                inspector.service_tier = response_service_tier(parse_json_bytes(bytes(body_capture))) or inspector.service_tier
         error_type, error_message = extract_error(bytes(error_capture), response.status)
         if client_error:
             error_type = "client_disconnect"
@@ -12383,6 +12666,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             response_bytes,
             started,
             force_failed=bool(client_error),
+            response_tier=inspector.service_tier,
         )
         self._record_event(event, info)
 
@@ -12398,8 +12682,13 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
         response_bytes: int,
         started: float,
         force_failed: bool = False,
+        response_tier: str | None = None,
     ) -> UsageEvent:
-        components = self.meter_server.repo.price_components_for(model, usage)
+        service_tier = normalize_service_tier(response_tier) or info.requested_service_tier
+        tier_source = "response" if normalize_service_tier(response_tier) else (
+            "request" if info.requested_service_tier else None
+        )
+        components = self.meter_server.repo.price_components_for(model, usage, service_tier)
         return UsageEvent(
             ts=utc_now(),
             identity_key=info.identity_key,
@@ -12442,6 +12731,9 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             error_message_redacted=redact_text(error_message),
             request_bytes=request_bytes,
             response_bytes=response_bytes,
+            service_tier=service_tier,
+            requested_service_tier=info.requested_service_tier,
+            service_tier_source=tier_source,
         )
 
     def _record_event(self, event: UsageEvent, info: RequestInfo) -> None:
