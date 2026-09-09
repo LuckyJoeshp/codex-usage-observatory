@@ -266,6 +266,56 @@ class Sub2APIImporterTest(unittest.TestCase):
         self.fake_thread.join(timeout=2)
         self.temp.cleanup()
 
+    def test_session_suffix_backfills_existing_rows_without_duplicate_usage(self) -> None:
+        self.fake.usage.append(usage_fixture(70_002, SECOND_ACCOUNT_SELECTOR))
+        self.assertEqual(self.importer.import_once()["new"], 2)
+        before = self.repo.token_breakdown("all")
+        sessions = [
+            "11111111-2222-4333-8444-555555550042",
+            "11111111-2222-4333-8444-55555555b70c",
+        ]
+        for record, session in zip(self.fake.usage, sessions):
+            record["session_id"] = session
+        result = self.importer.import_once()
+        self.assertEqual((result["new"], result["changed"]), (0, 2))
+        self.assertEqual(self.repo.token_breakdown("all"), before)
+        rows = self.repo.recent_account_attempts(50)
+        self.assertEqual([row["session_id_suffix"] for row in rows], ["b70c", "0042"])
+        self.assertTrue(all(row["session_id"] is None for row in rows))
+        page = meter.dashboard_html(self.repo, account_resolver=self.resolver)
+        table = page.split("最近 50 次账号尝试", 1)[1].split("</article>", 1)[0]
+        self.assertIn("Session 末4位", table)
+        self.assertRegex(table, r"0042</code></td><td>alpha@example\.test")
+        self.assertRegex(table, r"b70c</code></td><td>new-account@example\.test")
+        self.assertIn("Sub2API", table)
+        self.assertIn(">成功</span>", table)
+        self.assertNotIn(">200</span>", table)
+        replay = self.importer.import_once()
+        self.assertEqual((replay["unchanged"], replay["write_transactions"]), (2, 0))
+        self.repo.apply_privacy_minimization(self.resolver)
+        reopened = meter.UsageRepository(self.db)
+        self.assertEqual(
+            [row["session_id_suffix"] for row in reopened.recent_account_attempts(50)],
+            ["b70c", "0042"],
+        )
+        with reopened.connect() as connection:
+            dump = "\n".join(connection.iterdump())
+        for session in sessions:
+            self.assertNotIn(session, dump)
+            self.assertNotIn(session, page)
+
+    def test_invalid_or_unavailable_sessions_have_no_suffix(self) -> None:
+        invalid_sessions = [None, "", 123456, {}, "abc", "<script>0042", "x" * 513]
+        self.fake.usage = [
+            {**usage_fixture(70_001 + index, ACCOUNT_SELECTOR), "session_id": session}
+            for index, session in enumerate(invalid_sessions)
+        ]
+        self.importer.import_once()
+        self.assertTrue(all(
+            row["session_id_suffix"] is None
+            for row in self.repo.recent_account_attempts(50)
+        ))
+
     def test_astra_long_context_import_uses_flat_rates_without_replay_churn(self) -> None:
         self.repo.set_price("gpt-6-astra", 10, 50, 1, "fixture pricing")
         record = self.fake.usage[0]
@@ -530,6 +580,7 @@ class Sub2APIImporterTest(unittest.TestCase):
         self.assertIsNone(observation)
 
     def test_privacy_retired_record_is_not_recreated(self) -> None:
+        self.fake.usage[0]["session_id"] = "11111111-2222-4333-8444-555555550042"
         self.importer.import_once()
         with self.repo.connect() as connection:
             imported = connection.execute(

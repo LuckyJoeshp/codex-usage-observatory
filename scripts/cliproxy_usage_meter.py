@@ -232,6 +232,18 @@ def safe_alias(value: Any) -> str | None:
     return None
 
 
+def session_id_suffix(value: Any) -> str | None:
+    """Reduce an explicit session ID to four display characters before storage."""
+
+    if not isinstance(value, str) or len(value) > 512:
+        return None
+    value = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{3,511}", value):
+        return None
+    suffix = value[-4:]
+    return suffix if re.fullmatch(r"[A-Za-z0-9]{4}", suffix) else None
+
+
 def safe_model_identifier(value: Any) -> str | None:
     """Keep a useful model label without accepting arbitrary identity text."""
 
@@ -2482,6 +2494,7 @@ class UsageEvent:
     service_tier: str | None = None
     requested_service_tier: str | None = None
     service_tier_source: str | None = None
+    session_id_suffix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2868,6 +2881,12 @@ class UsageRepository:
             self._ensure_column(conn, "usage_events", "identity_key", "TEXT")
             self._ensure_column(conn, "usage_events", "source", "TEXT DEFAULT 'sidecar'")
             self._ensure_column(conn, "usage_events", "request_id", "TEXT")
+            self._ensure_column(
+                conn, "usage_events", "session_id_suffix",
+                "TEXT CHECK (session_id_suffix IS NULL OR "
+                "(length(session_id_suffix)=4 AND "
+                "session_id_suffix NOT GLOB '*[^A-Za-z0-9]*'))",
+            )
             for field in ("service_tier", "requested_service_tier", "service_tier_source"):
                 self._ensure_column(conn, "usage_events", field, "TEXT")
             self._ensure_column(conn, "local_import_files", "service_tier", "TEXT")
@@ -5036,6 +5055,7 @@ class UsageRepository:
             )
             if not identity_allowed:
                 values["identity_key"] = "unknown"
+                values["session_id_suffix"] = None
             cursor = conn.execute(
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
@@ -5059,6 +5079,11 @@ class UsageRepository:
         values = asdict(event)
         values["identity_key"] = (
             canonical_subscription_key(event.identity_key) or "unknown"
+        )
+        values["session_id_suffix"] = (
+            session_id_suffix(event.session_id_suffix)
+            if values["identity_key"] != "unknown" and event.account_attempt
+            else None
         )
         # The resolver already reduced an active account to an opaque HMAC
         # key. Request metadata and token/account fingerprints have no durable
@@ -5396,6 +5421,7 @@ class UsageRepository:
                 conn, canonical_key
             ):
                 values["identity_key"] = "unknown"
+                values["session_id_suffix"] = None
             cursor = conn.execute(
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
@@ -5590,6 +5616,7 @@ class UsageRepository:
                 # A suspect or retired key must not downgrade a still-live
                 # historical row during an external repricing scan.
                 values["identity_key"] = existing["identity_key"]
+                values["session_id_suffix"] = existing["session_id_suffix"]
             changed_columns = tuple(
                 column
                 for column, value in values.items()
@@ -5612,6 +5639,7 @@ class UsageRepository:
         identity_key_value = canonical_subscription_key(values["identity_key"])
         if identity_key_value not in allowed_identity_keys:
             values["identity_key"] = "unknown"
+            values["session_id_suffix"] = None
         return _ImportedEventDecision(
             prepared,
             "new",
@@ -7382,11 +7410,12 @@ class UsageRepository:
             rows = conn.execute(
                 f"""
                 SELECT ts, identity_key, usage_alias, account_id_tail, account_id_hash,
-                  auth_fingerprint, session_id, model, endpoint, method,
+                  auth_fingerprint, session_id, session_id_suffix, model, endpoint, method,
                   status_code, ok, duration_ms, stream, input_tokens,
                   cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
                   estimated_api_cost_usd, non_cached_input_cost_usd,
                   cached_input_cost_usd, output_cost_usd, long_context_pricing_applied,
+                  service_tier, requested_service_tier, service_tier_source,
                   usage_missing, error_type,
                   error_message_redacted, source, request_id, account_attempt
                 FROM usage_events
@@ -9502,6 +9531,7 @@ class Sub2APIImporter:
             response_bytes=0,
             source=SUB2API_REQUEST_SOURCE,
             request_id=None,
+            session_id_suffix=session_id_suffix(record.get("session_id")),
             service_tier=service_tier,
             service_tier_source="upstream" if service_tier else None,
             account_attempt=int(record.get("account_id") is not None),
@@ -11767,12 +11797,34 @@ def dashboard_html(
         f'<td>{fmt_money(row.get("all_time_cost_usd"))}</td></tr>'
         for row in subscriptions
     ) or '<tr><td colspan="10" class="empty">暂无数据</td></tr>'
-    def _status_class(row: Mapping[str, Any]) -> str:
-        return "ok" if row.get("ok") else "bad"
+    def _recent_status(row: Mapping[str, Any]) -> str:
+        status_class = "ok" if row.get("ok") else "bad"
+        inferred = row.get("source") in {
+            SUB2API_REQUEST_SOURCE, "codex_app_local", "manual_codex_app",
+        } and row.get("ok")
+        label = "成功" if inferred else str(row.get("status_code") or "未知")
+        title = "用量记录推定成功，来源未提供 HTTP 状态码" if inferred else "HTTP 状态码"
+        return (
+            f'<span class="status-pill {status_class}" title="{title}">'
+            f'{html.escape(label)}</span>'
+        )
+
+    recent_source_labels = {
+        SUB2API_REQUEST_SOURCE: "Sub2API",
+        "codex_app_local": "Codex 本地",
+        "manual_codex_app": "手动汇总",
+        "cockpit_tools": "Cockpit Tools",
+        "sidecar": "8327 代理",
+        "usage_queue": "8317 队列",
+    }
 
     recent_rows = "".join(
-        f'<tr><td>{html.escape(fmt_local_time(row["ts"], seconds=True))}</td><td>{html.escape(dashboard_identity(row))}</td>'
-        f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
+        f'<tr><td>{html.escape(fmt_local_time(row["ts"], seconds=True))}</td>'
+        f'<td><code class="session-suffix">{html.escape(row.get("session_id_suffix") or "—")}</code></td>'
+        f'<td>{html.escape(dashboard_identity(row))}</td>'
+        f'<td>{html.escape(str(row["model"] or "—"))}'
+        f'<small class="recent-source">{html.escape(recent_source_labels.get(row.get("source"), "未知来源"))}</small></td>'
+        f'<td>{_recent_status(row)}</td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
         f'<td>{html.escape(service_tier_label(row))} · {context_price_label(row)}</td>'
@@ -11781,7 +11833,7 @@ def dashboard_html(
         f'<td>{fmt_money(row["cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["estimated_api_cost_usd"])}</td></tr>'
         for row in recent
-    ) or '<tr><td colspan="12" class="empty">暂无数据</td></tr>'
+    ) or '<tr><td colspan="13" class="empty">暂无数据</td></tr>'
 
     tier_rows = "".join(
         f'<tr><td>{html.escape(row["model"] or "未知模型")}</td>'
@@ -11794,13 +11846,6 @@ def dashboard_html(
         f'<td>{fmt_int(row["unpriced_calls"])}</td></tr>'
         for row in tier_groups
     ) or '<tr><td colspan="9" class="empty">暂无数据</td></tr>'
-
-    session_notice = (
-        '<div class="notice warning-notice"><b>会话关联已按隐私策略关闭</b>'
-        '<span>session/thread/turn/request ID 不写入 SQLite；本页是跨 session 的 token 汇总，'
-        '不能直接与某个 tmux /status 做同范围比较。“实际消耗”只统一了 token 算法'
-        '（非缓存输入 + 输出）。</span></div>'
-    )
 
     cockpit_notice = (
         '<div class="notice app-import-notice"><b>Cockpit Tools 只读导入</b>'
@@ -11962,6 +12007,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 .system-strip{{display:flex;flex-wrap:wrap;gap:9px;margin-top:27px}}.system-strip span{{padding:7px 10px;border:1.5px solid var(--ink);border-radius:999px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-2);font:700 9px/1 var(--font-mono)}}.system-strip span:nth-child(1){{background:var(--mint);color:var(--on-color)}}.system-strip span:nth-child(2){{background:var(--sky);color:var(--on-color)}}.system-strip span:nth-child(3){{background:var(--sun);color:var(--on-color)}}.system-strip b{{color:inherit}}footer{{margin-top:24px;padding-top:16px;border-top:2px solid var(--ink);color:var(--ink-3);font:600 9px/1.65 var(--font-mono)}}
 @media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.form-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid,.form-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
 .account-head i.confirmed{{background:var(--rose)}}.account-head i.reported{{background:var(--sun)}}.account-head i.available{{background:var(--mint)}}
+.session-suffix{{display:inline-block;min-width:4ch;font:700 13px/1.4 var(--font-mono);letter-spacing:0}}.recent-source{{display:block;margin-top:3px;color:var(--ink-3);font:600 10px/1.3 var(--font-mono);letter-spacing:0}}
 {RESPONSE_TIMELINE_CSS}
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">CU</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Codex Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
@@ -11970,7 +12016,6 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 	{cockpit_notice}
 	{sub2api_notice}
 	{manual_import}
-{session_notice}
 <div class="notice"><b>按模型计费</b><span>gpt-6-astra 长短上下文统一费率，不加收长上下文费用。其他具有长上下文价格档的模型，按每次调用完整 input tokens 判断：≤272K 使用短档，&gt;272K 使用长档；cached tokens 计入输入阈值，并按对应缓存单价计费。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
 <section class="period-grid">{period_cards}</section>
@@ -11981,7 +12026,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex provider 实际窗口（按时长归类为 5 小时/周/月）；美元额度优先按当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
 <div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近账号尝试；账号选择前的网关鉴权拒绝仅保留在调用/失败历史，不计入模型消费、账号尝试或 HTTP 响应时间轴。</p></div></div>
-  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><p class="table-note">这是历史完成记录（时间精确到秒）；账号进入冷却不会删除冷却前的成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
+  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel" data-role="recent-attempts"><h3>最近 50 次账号尝试</h3><p class="table-note">历史完成记录（时间精确到秒）；Sub2API/本地用量的“成功”为推定状态，不含完整失败重试。账号进入冷却不会删除历史成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th title="原始 Session ID 的最后 4 个字符">Session 末4位</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 	<div class="system-strip"><span>CLIProxyAPI queue <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>Sub2API <b>{html.escape(sub2api_strip_text)}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>

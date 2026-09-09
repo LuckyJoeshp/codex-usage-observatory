@@ -103,6 +103,21 @@ class ServiceTierPricingTest(unittest.TestCase):
         self.assertAlmostEqual(unknown.estimated_api_cost_usd, 0.0078)
         self.assertNotEqual(meter.service_tier_label(vars(fast)), meter.service_tier_label(vars(unknown)))
 
+    def test_recent_attempts_preserve_actual_requested_and_unknown_tiers(self):
+        events = [self.event("fast", "default"), self.event("priority"), self.event()]
+        for event in events:
+            self.repo.insert_event(event)
+        recent = self.repo.recent_account_attempts(50)
+        self.assertEqual(
+            [meter.service_tier_label(row) for row in recent],
+            [meter.service_tier_label(vars(event)) for event in reversed(events)],
+        )
+        page = meter.dashboard_html(self.repo)
+        table = page.split("最近 50 次账号尝试", 1)[1].split("</article>", 1)[0]
+        self.assertIn("Standard（Fast 已降级）", table)
+        self.assertIn("Fast（请求估算）", table)
+        self.assertIn("模式未知", table)
+
     def test_sse_final_response_tier_wins_and_nested_content_is_ignored(self):
         inspector = meter.SSEInspector()
         events = [

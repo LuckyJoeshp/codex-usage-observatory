@@ -560,8 +560,11 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 最近 50 次账号尝试（已到达订阅账号选择阶段）：
 
 - ts
+- Sub2API session_id 的末 4 位字符（完整 ID 不落库；缺失显示 `—`）
 - alias/account
 - model
+- 采集来源；Sub2API/本地成功用量显示推定“成功”，真实 HTTP 来源显示状态码
+- 计费档保留实际服务等级、请求等级和等级来源
 - endpoint
 - status
 - duration_ms
