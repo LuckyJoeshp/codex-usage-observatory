@@ -63,6 +63,12 @@ more than one path, enable only one of those paths to avoid double counting.
 
 ## Quick start
 
+Python 3.14 is supported. The runtime uses only the standard library and can
+share the same interpreter as other projects. With pyenv, select Python 3.14
+globally and use `python3` (the pyenv shim) in persistent launch commands so
+they follow the shared version. No project virtualenv or `.python-version`
+override is required.
+
 ```bash
 git clone https://github.com/LuckyJoeshp/codex-usage-observatory.git
 cd codex-usage-observatory
@@ -491,7 +497,8 @@ be set with `--set-price MODEL_PATTERN INPUT_PER_M OUTPUT_PER_M` plus
 ## Tests
 
 ```bash
-pytest -q
+python3 -m pip install pytest
+python3 -m pytest -q
 ```
 
 The suite covers Responses and Chat Completions usage normalization, streaming
