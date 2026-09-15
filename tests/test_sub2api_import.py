@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import re
 import sqlite3
@@ -7,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -265,6 +267,132 @@ class Sub2APIImporterTest(unittest.TestCase):
         self.fake.server_close()
         self.fake_thread.join(timeout=2)
         self.temp.cleanup()
+
+    def test_structured_subscription_identity_matches_desktop_without_local_scan(self) -> None:
+        record = self.fake.accounts[0]
+        self.resolver.register_sub2api_accounts(self.importer.instance_scope, [record])
+        fallback_key = meter.resolved_identity_key(
+            self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)
+        )
+        record["credentials"].update({
+            "chatgpt_account_id": "workspace-desktop",
+            "chatgpt_user_id": "member-desktop",
+            "email": "alpha@example.test",
+            "plan_type": "pro",
+        })
+        record["extra"].pop("plan_type")
+        desktop = self.resolver._identity(
+            None, "workspace-desktop", "alpha@example.test", "member-desktop"
+        )
+        # The same email in another workspace must not win over the explicit
+        # workspace supplied by Sub2API, even when it is the only local match.
+        other_workspace = self.resolver._identity(
+            None, "workspace-other", "alpha@example.test"
+        )
+        self.resolver.register_codex_app_home("other-home", other_workspace)
+        self.resolver.register_sub2api_accounts(self.importer.instance_scope, [record])
+        actual = self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)
+        self.assertEqual(
+            meter.resolved_identity_key(actual), meter.resolved_identity_key(desktop)
+        )
+        self.assertNotEqual(
+            meter.resolved_identity_key(actual), meter.resolved_identity_key(other_workspace)
+        )
+        self.assertEqual(
+            self.resolver.identity_migrations()[fallback_key], meter.resolved_identity_key(desktop)
+        )
+        self.importer.import_once()
+        row = next(
+            item for item in self.repo.subscription_dashboard_rows()
+            if item["identity_key"] == meter.resolved_identity_key(desktop)
+        )
+        self.assertEqual(row["plan_type"], "pro")
+
+    def test_email_only_account_matches_unique_desktop_home_but_not_ambiguous_email(self) -> None:
+        desktop = self.resolver._identity(None, "workspace-desktop", "alpha@example.test")
+        self.resolver.register_codex_app_home("desktop-home", desktop)
+        self.resolver.register_sub2api_accounts(self.importer.instance_scope, self.fake.accounts)
+        self.assertEqual(
+            meter.resolved_identity_key(self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)),
+            meter.resolved_identity_key(desktop),
+        )
+        second = self.resolver._identity(None, "workspace-second", "alpha@example.test")
+        self.resolver.register_codex_app_home("second-home", second)
+        self.resolver.register_sub2api_accounts(self.importer.instance_scope, self.fake.accounts)
+        actual = meter.resolved_identity_key(
+            self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)
+        )
+        self.assertNotIn(
+            actual, {meter.resolved_identity_key(desktop), meter.resolved_identity_key(second)}
+        )
+        self.assertNotIn(actual, self.resolver.identity_migrations())
+
+    def test_existing_desktop_and_sub2api_history_share_one_window_estimate(self) -> None:
+        self.fake.accounts = self.fake.accounts[:1]
+        account = self.fake.accounts[0]
+        account["extra"]["codex_7d_used_percent"] = 50.0
+        self.fake.usage = [
+            usage_fixture(70_001, ACCOUNT_SELECTOR, created_at="2026-08-12T02:00:00Z"),
+            usage_fixture(70_002, ACCOUNT_SELECTOR, created_at="2026-08-19T02:00:00Z"),
+        ]
+        for record, cost in zip(self.fake.usage, (30.0, 10.0)):
+            record.update(
+                input_cost=cost, output_cost=0.0, cache_creation_cost=0.0,
+                cache_read_cost=0.0, total_cost=cost,
+            )
+        with mock.patch.object(meter, "utc_now", return_value="2026-08-19T04:00:00.000000Z"):
+            self.importer.import_once()
+            old_key = meter.resolved_identity_key(
+                self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)
+            )
+            desktop = self.resolver._identity(None, "workspace-desktop", "alpha@example.test")
+            desktop_key = meter.resolved_identity_key(desktop)
+            self.resolver.register_codex_app_home("desktop-home", desktop)
+            self.repo.register_codex_app_subscription(desktop_key)
+            converted = self.importer._event_from_record(self.fake.usage[1])
+            assert converted is not None
+            local_event = replace(
+                converted[0], identity_key=desktop_key, source="codex_app_local",
+                estimated_api_cost_usd=90.0, non_cached_input_cost_usd=90.0,
+            )
+            self.repo.record_imported_event(local_event, "desktop-fixture-event", "codex_app_local")
+            before = self.repo.token_breakdown("all")
+            # Old rows outside the incremental API response still need to be
+            # merged, together with their quota snapshots and registry entry.
+            self.fake.usage = []
+            self.importer.import_once()
+            rows = self.repo.subscription_dashboard_rows()
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["identity_key"], desktop_key)
+            self.assertEqual(row["all_time_account_attempts"], 3)
+            self.assertAlmostEqual(row["all_time_cost_usd"], 130.0)
+            self.assertAlmostEqual(row["current_window_observed_usd"], 100.0)
+            self.assertAlmostEqual(row["current_window_full_quota_usd"], 200.0)
+            self.assertEqual(self.repo.token_breakdown("all"), before)
+            with self.repo.connect() as connection:
+                for table in (
+                    "usage_events", "subscription_quota_snapshots", "active_subscription_registry"
+                ):
+                    self.assertEqual(
+                        connection.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE identity_key=?", (old_key,)
+                        ).fetchone()[0],
+                        0,
+                    )
+            # A provider rescan must not discard the independent Sub2API
+            # lineage or recreate a separate card on the next import.
+            self.resolver.enabled = True
+            self.resolver.active_subscription_keys(force_refresh=True)
+            self.assertEqual(self.resolver.identity_migrations()[old_key], desktop_key)
+            self.importer.import_once()
+            self.assertEqual(len(self.repo.subscription_dashboard_rows()), 1)
+            self.assertEqual(self.repo.token_breakdown("all"), before)
+            self.assertEqual(len(self.repo.recent_account_attempts(50)), 3)
+            page = meter.dashboard_html(self.repo, account_resolver=self.resolver)
+            self.assertIn("$200.00", page)
+            self.assertIn("累计消费 $130.00", page)
+            self.assertIn("本周已采集 $100.00 ÷ 已用 50% · 中置信度", page)
 
     def test_session_suffix_backfills_existing_rows_without_duplicate_usage(self) -> None:
         self.fake.usage.append(usage_fixture(70_002, SECOND_ACCOUNT_SELECTOR))
@@ -814,7 +942,7 @@ class Sub2APIImporterTest(unittest.TestCase):
             page = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
             self.assertIn("Sub2API 只读同步正常", page)
-            self.assertIn("S = Sub2API account", page)
+            self.assertIn("S = Sub2API 额度同步", page)
             self.assertIn("Sub2API 可调度", page)
             self.assertIn("Sub2API 账号异常", page)
             self.assertIn("时间轴固定合并 Sub2API", page)
@@ -827,6 +955,11 @@ class Sub2APIImporterTest(unittest.TestCase):
             server_thread.join(timeout=2)
 
     def test_database_contains_no_remote_identity_or_credentials(self) -> None:
+        self.fake.accounts[0]["credentials"].update({
+            "chatgpt_account_id": "workspace-private-fixture",
+            "chatgpt_user_id": "member-private-fixture",
+            "email": "alpha@example.test",
+        })
         self.importer.import_once()
         forbidden = (
             ADMIN_KEY,
@@ -835,6 +968,8 @@ class Sub2APIImporterTest(unittest.TestCase):
             "fixture-access-token-never-persist",
             "fixture-refresh-token-never-persist",
             "fixture-private-note-never-persist",
+            "workspace-private-fixture",
+            "member-private-fixture",
             "sub2api-request-70001-never-persist",
             str(ACCOUNT_SELECTOR),
             str(SECOND_ACCOUNT_SELECTOR),

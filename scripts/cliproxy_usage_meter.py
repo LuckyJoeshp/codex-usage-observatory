@@ -825,6 +825,7 @@ class AccountResolver:
         # these identities are ever written to the meter database.
         self._sub2api_accounts: dict[str, AccountIdentity] = {}
         self._sub2api_identity_keys: dict[str, AccountIdentity] = {}
+        self._sub2api_identity_migrations: dict[str, str] = {}
         # Independently signed-in Codex homes are an account source too.
         # Keep their labels across provider rescans, exclusively in memory.
         self._codex_app_homes: dict[str, AccountIdentity] = {}
@@ -1042,7 +1043,9 @@ class AccountResolver:
         if not key:
             return AccountIdentity(None, None, None)
         self._refresh_if_needed()
-        canonical = self._legacy_identity_keys.get(key, key)
+        canonical = self._sub2api_identity_migrations.get(
+            key, self._legacy_identity_keys.get(key, key)
+        )
         return self._identity_keys.get(
             canonical,
             self._codex_app_identity_keys.get(
@@ -1109,10 +1112,11 @@ class AccountResolver:
     ) -> dict[str, AccountIdentity]:
         """Replace the in-memory Sub2API account inventory.
 
-        A unique email match reuses an existing CLIProxyAPI/Cockpit identity.
-        Otherwise the Sub2API instance and numeric selector receive a stable,
-        domain-separated HMAC identity.  Raw selectors and labels never leave
-        this in-memory mapping.
+        Structured workspace/member metadata uses the same subscription key
+        as desktop auth. Without a workspace, a unique email match can reuse
+        a CLIProxyAPI, Cockpit or independently signed-in desktop identity.
+        Otherwise use a stable HMAC of the instance and numeric selector.
+        Proven fallback lineage is retained separately from provider rescans.
         """
 
         scope = safe_text(instance_scope, 512)
@@ -1121,7 +1125,9 @@ class AccountResolver:
         self._refresh_if_needed()
         with self._lock:
             email_candidates: dict[str, dict[str, AccountIdentity]] = {}
-            for key, identity in self._identity_keys.items():
+            for key, identity in (
+                self._codex_app_identity_keys | self._identity_keys
+            ).items():
                 normalized = normalize_email_identity(identity.account_email)
                 canonical = canonical_subscription_key(key)
                 if normalized and canonical:
@@ -1129,6 +1135,7 @@ class AccountResolver:
 
             accounts: dict[str, AccountIdentity] = {}
             identity_keys: dict[str, AccountIdentity] = {}
+            migrations: dict[str, str] = {}
             for record in records:
                 raw_id = record.get("id")
                 if isinstance(raw_id, bool):
@@ -1141,16 +1148,26 @@ class AccountResolver:
                     continue
                 extra = record.get("extra")
                 extra = extra if isinstance(extra, Mapping) else {}
-                email = safe_email(extra.get("email")) or safe_email(record.get("name"))
+                credentials = record.get("credentials")
+                credentials = credentials if isinstance(credentials, Mapping) else {}
+                email = (
+                    safe_email(credentials.get("email"))
+                    or safe_email(extra.get("email"))
+                    or safe_email(record.get("name"))
+                )
                 normalized = normalize_email_identity(email)
-                matches = email_candidates.get(normalized or "", {})
-                identity = next(iter(matches.values())) if len(matches) == 1 else None
+                workspace = safe_text(credentials.get("chatgpt_account_id"), 256)
+                principal = safe_text(credentials.get("chatgpt_user_id"), 512)
+                identity = None
+                if workspace and (normalized or principal):
+                    identity = self._identity(None, workspace, email, principal)
+                elif not workspace:
+                    matches = email_candidates.get(normalized or "", {})
+                    identity = next(iter(matches.values())) if len(matches) == 1 else None
+                subscription_hash = self._private_hash(
+                    "sub2api-account-v1", scope, account_id
+                )
                 if identity is None:
-                    subscription_hash = self._private_hash(
-                        "sub2api-account-v1",
-                        scope,
-                        account_id,
-                    )
                     identity = AccountIdentity(
                         None,
                         self._private_hash(
@@ -1167,10 +1184,14 @@ class AccountResolver:
                 key = resolved_identity_key(identity)
                 if not canonical_subscription_key(key):
                     continue
+                fallback_key = f"subscription:{subscription_hash}"
+                if fallback_key != key:
+                    migrations[fallback_key] = key
                 accounts[account_id] = identity
                 identity_keys[key] = identity
             self._sub2api_accounts = accounts
             self._sub2api_identity_keys = identity_keys
+            self._sub2api_identity_migrations = migrations
             return dict(accounts)
 
     def resolve_sub2api_account(self, account_id: Any) -> AccountIdentity:
@@ -1297,10 +1318,10 @@ class AccountResolver:
         }
 
     def identity_migrations(self) -> dict[str, str]:
-        """Return safe legacy-to-HMAC lineage proven by current auth files."""
+        """Return lineage proven by current auth and registered accounts."""
 
         self._refresh_if_needed()
-        return dict(self._legacy_identity_keys)
+        return self._legacy_identity_keys | self._sub2api_identity_migrations
 
     def ambiguous_legacy_account_keys(self) -> set[str]:
         """Return workspace-only keys shared by multiple current members."""
@@ -4490,7 +4511,9 @@ class UsageRepository:
     def apply_privacy_minimization(self, resolver: AccountResolver) -> int:
         """Migrate proven identities, then remove unnecessary identity detail."""
 
-        migrations = resolver.identity_migrations() if resolver.enabled else {}
+        # Disabling filesystem discovery does not disable identities supplied
+        # explicitly by the authenticated Sub2API importer.
+        migrations = resolver.identity_migrations()
         ambiguous_accounts = (
             resolver.ambiguous_legacy_account_keys() if resolver.enabled else set()
         )
@@ -8983,6 +9006,7 @@ class Sub2APIImporter:
         self._last_observation_updates = 0
         self._last_account_count = 0
         self._last_quota_rows = 0
+        self._identity_migration_marker: str | None = None
         self._api_available = False
         self._inventory_result: dict[str, Any] = {
             "authoritative": False,
@@ -9316,6 +9340,8 @@ class Sub2APIImporter:
             identity_key_value = f"subscription:{identity.subscription_id_hash}"
             extra = account.get("extra")
             extra = extra if isinstance(extra, Mapping) else {}
+            credentials = account.get("credentials")
+            credentials = credentials if isinstance(credentials, Mapping) else {}
             state = self._account_state(account, now)
             available = (
                 True
@@ -9337,7 +9363,9 @@ class Sub2APIImporter:
             rate_limited = (
                 True if state == "rate_limited" else (False if state == "active" else None)
             )
-            plan_type = safe_plan_type(extra.get("plan_type"))
+            plan_type = safe_plan_type(extra.get("plan_type")) or safe_plan_type(
+                credentials.get("plan_type")
+            )
             active_until = normalize_optional_timestamp(account.get("expires_at"))
             common = {
                 "identity_key": identity_key_value,
@@ -9573,6 +9601,17 @@ class Sub2APIImporter:
             {"sort_by": "id", "sort_order": "asc"},
         )
         self.resolver.register_sub2api_accounts(self.instance_scope, accounts)
+        migrations = self.resolver.identity_migrations()
+        migration_marker = short_hash(
+            json.dumps(sorted(migrations.items()), separators=(",", ":"))
+        )
+        if migration_marker != self._identity_migration_marker:
+            # Move existing history before the inventory sees its fallback
+            # key as missing. Incremental usage responses cannot repair older
+            # rows or quota snapshots outside their replay range.
+            if migrations:
+                self.repo.apply_privacy_minimization(self.resolver)
+            self._identity_migration_marker = migration_marker
         self._inventory_result = self.repo.reconcile_subscription_inventory(
             self.resolver.active_subscription_keys(),
             utc_now(),
@@ -10933,7 +10972,7 @@ def identity_badge(row: Mapping[str, Any]) -> tuple[str, str]:
         and window.get("source") in {SUB2API_ACCOUNT_SOURCE, SUB2API_QUOTA_SOURCE}
         for window in windows.values()
     ):
-        return "S", "S = Sub2API account（由本机 Sub2API 只读同步）"
+        return "S", "S = Sub2API 额度同步（调用可来自桌面端等多个来源）"
     alias = safe_text(row.get("usage_alias"), 128) or ""
     if re.fullmatch(r"codex-\d+", alias, re.IGNORECASE):
         return "C", "C = Codex alias（已映射本机 CODEX_HOME）"
@@ -11659,6 +11698,17 @@ def dashboard_html(
             f"{row.get('quota_estimate_confidence') or 'unknown'}"
             if full_quota is not None else f"当前已观测 ≥ {fmt_money(floor)} · 低置信度"
         )
+        if row.get("quota_estimate_method") == "current_window_percent_projection":
+            period_label = "本月" if windows.get("monthly") else "本周"
+            confidence_label = {
+                "initial": "初步估算",
+                "medium": "中置信度",
+                "high": "高置信度",
+            }.get(row.get("quota_estimate_confidence"), "低置信度")
+            quota_note = (
+                f"{period_label}已采集 {fmt_money(row.get('current_window_observed_usd'))}"
+                f" ÷ 已用 {fmt_percent(row.get('quota_used_percent'))} · {confidence_label}"
+            )
         account_label = dashboard_identity(row)
         plan = "LEGACY" if legacy_ambiguous else str(row.get("plan_type") or "unknown").upper()
         upstream_reports_zero = any(
