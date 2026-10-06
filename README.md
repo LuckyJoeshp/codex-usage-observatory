@@ -113,6 +113,11 @@ must remain inside the current user's home directory. Only token-count and
 rate-limit metadata is read; prompts, code, tool output, and credentials are
 never persisted.
 
+Session files continue to be tailed after they grow beyond 128 MiB. Collection
+resumes from the saved byte offset; oversized image/tool records are skipped
+with bounded reads, and unfinished JSONL records are retried on the next poll.
+Usage metadata after a large record is still imported and priced normally.
+
 The first dynamic scan of a home or newly discovered JSONL establishes an
 end-of-file safety boundary. An account change establishes a new boundary
 before collection resumes, so unread historical records cannot be guessed to

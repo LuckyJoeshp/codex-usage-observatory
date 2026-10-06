@@ -77,7 +77,9 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_CODEX_APP_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_APP_ALIAS: str | None = None
 DEFAULT_CODEX_APP_POLL_SECONDS = 15.0
-MAX_CODEX_APP_JSONL_BYTES = 128 * 1024 * 1024
+# Bound individual records, not growing session files. Image/tool records can
+# be huge while the usage and model metadata after them remains small.
+MAX_CODEX_APP_RECORD_BYTES = 4 * 1024 * 1024
 DEFAULT_CODEX_APP_MAX_FILES = 500
 DEFAULT_COCKPIT_TOOLS_DATA_DIR = Path.home() / ".antigravity_cockpit"
 COCKPIT_TOOLS_LOG_DB_NAME = "codex_local_access_logs.sqlite"
@@ -6022,7 +6024,9 @@ class UsageRepository:
             ).fetchone()
         return dict(row) if row is not None else None
 
-    def save_local_import_binding(self, home_key: str, binding_key: str) -> None:
+    def save_local_import_binding(
+        self, home_key: str, binding_key: str, *, bound_at: str | None = None
+    ) -> None:
         """Persist only keyed digests proving the currently observed binding."""
 
         if not re.fullmatch(r"home:[0-9a-f]{32}", home_key):
@@ -6043,7 +6047,7 @@ class UsageRepository:
                        ELSE excluded.bound_at
                      END,
                      updated_at=excluded.updated_at""",
-                (home_key, binding_key, now, now),
+                (home_key, binding_key, bound_at or now, now),
             )
 
     def record_quota_hit(
@@ -9992,7 +9996,6 @@ class CodexAppLocalImporter:
                 if (
                     not path.is_file()
                     or not self._is_within(resolved, sessions)
-                    or stat.st_size > MAX_CODEX_APP_JSONL_BYTES
                 ):
                     continue
                 ranked.append((int(stat.st_mtime_ns), resolved))
@@ -10112,11 +10115,17 @@ class CodexAppLocalImporter:
                 binding is None
                 or binding.get("binding_key") != context.binding_key
             )
+            # A file may have been omitted by the file-count limit (or the
+            # former file-size limit) during an account switch. Its cursor
+            # must cross the current binding boundary before importing again.
             file_states = self.repo.local_import_file_states(paths)
             file_needs_baseline = [
                 binding_changed or prior_state is None
+                or str(prior_state.get("updated_at") or "")
+                < str((binding or {}).get("bound_at") or "")
                 for prior_state in file_states
             ]
+            scan_started_at = utc_now()
             scans = [
                 self._scan_file(
                     path,
@@ -10154,7 +10163,9 @@ class CodexAppLocalImporter:
             imported += imported_delta
             quota_rows += quota_delta
             if binding_changed:
-                self.repo.save_local_import_binding(home_key, context.binding_key)
+                self.repo.save_local_import_binding(
+                    home_key, context.binding_key, bound_at=scan_started_at
+                )
             baselined_files += sum(file_needs_baseline)
             matched_homes += 1
         return {
@@ -10217,7 +10228,7 @@ class CodexAppLocalImporter:
                 and int(state.get("mtime_ns") or -1) == int(stat.st_mtime_ns)
                 and int(state.get("offset") or -1) == int(stat.st_size)
             )
-            if unchanged:
+            if unchanged and collect_usage:
                 return CodexAppFileScan(True, None, events, quota_snapshots)
             can_resume = (
                 state
@@ -10230,13 +10241,37 @@ class CodexAppLocalImporter:
                 model_provider = safe_text(state.get("model_provider"), 64)
                 model = safe_text(state.get("model"), 200)
                 service_tier = normalize_service_tier(state.get("service_tier"))
-            handle = path.open("r", encoding="utf-8", errors="replace")
+            handle = path.open("rb")
             if start_offset:
                 handle.seek(start_offset)
         except OSError:
             return CodexAppFileScan(False, None, events, quota_snapshots)
+        final_offset = start_offset
         with handle:
-            for line in handle:
+            # Read only the snapshot observed above, with a bounded buffer.
+            # Advance the durable cursor only past complete JSONL records so
+            # an in-flight write (including a split UTF-8 character) is retried.
+            while handle.tell() < stat.st_size:
+                line = handle.readline(
+                    min(MAX_CODEX_APP_RECORD_BYTES + 1, stat.st_size - handle.tell())
+                )
+                oversized = len(line) > MAX_CODEX_APP_RECORD_BYTES
+                while (
+                    oversized and line and not line.endswith(b"\n")
+                    and handle.tell() < stat.st_size
+                ):
+                    line = handle.readline(
+                        min(MAX_CODEX_APP_RECORD_BYTES + 1, stat.st_size - handle.tell())
+                    )
+                if not line.endswith(b"\n"):
+                    if not collect_usage:
+                        # Do not let a record begun before an account baseline
+                        # become attributable just because it finishes later.
+                        return CodexAppFileScan(False, None, [], [])
+                    break
+                final_offset = handle.tell()
+                if oversized:
+                    continue
                 try:
                     record = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -10358,7 +10393,6 @@ class CodexAppLocalImporter:
                         }
                     )
                     quota_snapshots.append(window)
-            final_offset = handle.tell()
         try:
             final_stat = path.stat()
         except OSError:
