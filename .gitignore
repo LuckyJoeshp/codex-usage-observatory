@@ -3,6 +3,7 @@ __pycache__/
 datas/*.sqlite
 datas/*.sqlite-shm
 datas/*.sqlite-wal
+datas/*.sqlite.gz
 .DS_Store
 # Never place a CLIProxyAPI management credential in the project tree.
 *.key

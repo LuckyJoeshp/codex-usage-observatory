@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fnmatch
+import gzip
 import hashlib
 import hmac
 import html
@@ -23,10 +24,12 @@ import math
 import os
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -6721,6 +6724,103 @@ class UsageRepository:
             )
         return result
 
+    @staticmethod
+    def _compact_quota_snapshots_conn(
+        conn: sqlite3.Connection, identity_key: str | None = None
+    ) -> int:
+        """Keep exactly the quota observations used by dashboard consumers.
+
+        The current card uses the latest row per window. Prior-window cost
+        estimates use the latest row per reset, not every intermediate poll.
+        Preserve the newest nonempty plan/renewal independently as well, so
+        sparse future observations can still inherit that metadata.
+        """
+        scope = "WHERE identity_key=?" if identity_key is not None else ""
+        conn.execute(
+            f"""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY identity_key, window_kind,
+                               CASE WHEN window_kind='account_status'
+                                    THEN NULL ELSE reset_at END
+                           ORDER BY fetched_at DESC, id DESC
+                       ) AS period_rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY identity_key
+                           ORDER BY (plan_type IS NOT NULL) DESC,
+                                    fetched_at DESC, id DESC
+                       ) AS plan_rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY identity_key
+                           ORDER BY (subscription_active_until IS NOT NULL) DESC,
+                                    fetched_at DESC, id DESC
+                       ) AS renewal_rank
+                  FROM subscription_quota_snapshots {scope}
+            )
+            DELETE FROM subscription_quota_snapshots
+             WHERE id IN (
+                 SELECT id FROM ranked
+                  WHERE period_rank>1 AND plan_rank>1 AND renewal_rank>1
+             )
+            """,
+            (identity_key,) if identity_key is not None else (),
+        )
+        return int(conn.execute("SELECT changes()").fetchone()[0])
+
+    def _compressed_backup(self) -> Path:
+        """Atomically replace one owner-only backup instead of accumulating copies."""
+        backup = self.path.with_suffix(".backup.sqlite.gz")
+        packed_path: Path | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="usage-backup-") as directory:
+                snapshot = Path(directory) / "snapshot.sqlite"
+                with self.connect() as source, closing(sqlite3.connect(snapshot)) as target:
+                    source.backup(target)
+                    if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise sqlite3.DatabaseError("backup integrity check failed")
+                with tempfile.NamedTemporaryFile(
+                    dir=self.path.parent, prefix=".usage-backup-",
+                    suffix=".sqlite.gz", delete=False,
+                ) as packed:
+                    packed_path = Path(packed.name)
+                    with snapshot.open("rb") as source, gzip.GzipFile(
+                        filename="", fileobj=packed, mode="wb", mtime=0
+                    ) as compressed:
+                        shutil.copyfileobj(source, compressed, length=1024 * 1024)
+                    packed.flush()
+                    os.fsync(packed.fileno())
+                os.replace(packed_path, backup)
+                return backup
+        finally:
+            if packed_path is not None:
+                packed_path.unlink(missing_ok=True)
+
+    def compact_storage(self) -> dict[str, int]:
+        """Compact quota history offline; preserve usage, identity and timeline rows."""
+        backup = self._compressed_backup()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            before_bytes = int(conn.execute("PRAGMA page_count").fetchone()[0]) * page_size
+            before_rows = int(conn.execute(
+                "SELECT COUNT(*) FROM subscription_quota_snapshots"
+            ).fetchone()[0])
+            removed = self._compact_quota_snapshots_conn(conn)
+        with self.connect() as conn:
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            after_bytes = int(conn.execute("PRAGMA page_count").fetchone()[0]) * page_size
+        self._harden_storage_permissions()
+        return {
+            "quota_snapshots_before": before_rows,
+            "quota_snapshots_removed": removed,
+            "quota_snapshots_after": before_rows - removed,
+            "database_bytes_before": before_bytes,
+            "database_bytes_after": after_bytes,
+            "backup_bytes": backup.stat().st_size,
+        }
+
     def insert_subscription_quota_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
         allowed_windows = {"five_hour", "weekly", "monthly", "account_status"}
         window_kind = safe_text(snapshot.get("window_kind"), 32)
@@ -6828,6 +6928,7 @@ class UsageRepository:
                           AND fetched_at=:fetched_at""",
                     values,
                 )
+            self._compact_quota_snapshots_conn(conn, values["identity_key"])
             return inserted
 
     def latest_subscription_quotas(self) -> list[dict[str, Any]]:
@@ -13033,6 +13134,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON for queries")
     actions = parser.add_mutually_exclusive_group(required=False)
     actions.add_argument("--serve", action="store_true", help="Run the sidecar HTTP server")
+    actions.add_argument(
+        "--compact-storage", action="store_true",
+        help=(
+            "Keep dashboard quota observations and reclaim SQLite space; "
+            "stop the collector first. Replaces one compressed database backup."
+        ),
+    )
     actions.add_argument("--summary", metavar="PERIOD", help="Summary for today, all, or Nd")
     actions.add_argument("--by-account", metavar="PERIOD", help="Group by account/alias (today, all, or Nd)")
     actions.add_argument("--by-model", metavar="PERIOD", help="Group by model (today, all, or Nd)")
@@ -13276,6 +13384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not any(
         (
             args.serve,
+            args.compact_storage,
             args.summary,
             args.by_account,
             args.by_model,
@@ -13296,6 +13405,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     repo = UsageRepository(args.db)
+    if args.compact_storage:
+        print_rows([repo.compact_storage()], args.json)
+        return 0
     resolver = AccountResolver(
         enabled=not args.no_account_scan,
         cockpit_tools_data_dir=args.cockpit_tools_data_dir,

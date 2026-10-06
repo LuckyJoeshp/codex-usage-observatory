@@ -519,6 +519,26 @@ context in
 
 ## Privacy and data safety
 
+Usage rows retain the timestamp, account identity, token counts, model, status,
+and frozen cost needed by the dashboard. Request timelines and import cursors
+are retained too. Quota polling retains the latest account status and the last
+observation of each quota reset period, plus the latest known plan and renewal
+metadata. Intermediate quota polls are discarded during import; current
+quota cards and prior-period estimates keep their original inputs.
+
+To shrink a database created by an older collector, stop the collector and run:
+
+```bash
+python3 scripts/codex_usage_observatory.py --compact-storage --json
+```
+
+Pass `--db /path/to/usage.sqlite` for a custom database. Maintenance creates a
+consistent compressed backup alongside the database, replacing only the
+previous `*.backup.sqlite.gz` for that database, then compacts quota snapshots
+and reclaims SQLite space. Keep that one private backup; older manual database
+copies can be removed after validating the dashboard. Original Codex session
+logs are neither copied nor deleted by maintenance.
+
 The runtime SQLite database lives under `datas/` and is ignored by Git,
 including WAL files. Raw authorization headers, OAuth tokens, refresh tokens,
 API keys, and management keys are never persisted. The public repository

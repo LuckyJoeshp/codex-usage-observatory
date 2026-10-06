@@ -2027,7 +2027,8 @@ class UsageMeterMVPTest(unittest.TestCase):
         quota_rows = self.rows(
             "SELECT * FROM subscription_quota_snapshots WHERE source='codex_app_local'"
         )
-        self.assertEqual(len(quota_rows), 2)
+        # Repeated observations of the same quota period keep its latest row.
+        self.assertEqual(len(quota_rows), 1)
         quota = quota_rows[-1]
         self.assertEqual(quota["window_kind"], "five_hour")
         self.assertEqual(quota["used_percent"], 12.5)
