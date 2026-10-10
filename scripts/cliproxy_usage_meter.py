@@ -12376,8 +12376,10 @@ class MeterHTTPServer(ThreadingHTTPServer):
         self._dashboard_cache_body: bytes | None = None
         self._dashboard_cache_marker: tuple[Any, ...] | None = None
         self._dashboard_cache_at = 0.0
+        self._dashboard_refresh_inflight = False
         self._auth_reconcile_lock = threading.Lock()
         self._last_auth_reconcile_at = 0.0
+        self._auth_reconcile_inflight = False
 
     def cockpit_tools_status(self) -> dict[str, Any]:
         if self.cockpit_tools_import_enabled:
@@ -12428,9 +12430,21 @@ class MeterHTTPServer(ThreadingHTTPServer):
         """Discard the rendered page after a known identity migration."""
 
         with self._dashboard_cache_lock:
-            self._dashboard_cache_body = None
             self._dashboard_cache_marker = None
             self._dashboard_cache_at = 0.0
+
+    def _reconcile_dashboard_auth_background(self) -> None:
+        try:
+            rebound = self.repo.reconcile_auth_identities(self.resolver)
+        except Exception as exc:
+            LOG.warning("dashboard auth reconciliation failed: %s", type(exc).__name__)
+            rebound = 0
+        finally:
+            with self._auth_reconcile_lock:
+                self._auth_reconcile_inflight = False
+        if rebound:
+            LOG.info("reconciled %d provisional auth identity event(s)", rebound)
+            self.invalidate_dashboard_cache()
 
     def _maybe_reconcile_dashboard_auth(self) -> int:
         """Run the expensive identity pass only for an active usage queue.
@@ -12439,68 +12453,103 @@ class MeterHTTPServer(ThreadingHTTPServer):
         local importers apply their own privacy migrations.  Repeating the
         full-table transaction for every page request only adds SQLite lock
         contention.  When the optional management queue is enabled, retain the
-        safety net but cap it at one pass per interval.
+        safety net but cap it at one background pass per interval.
         """
 
         if not self.queue_poller.status().get("enabled"):
             return 0
         now = time.monotonic()
         with self._auth_reconcile_lock:
-            if now - self._last_auth_reconcile_at < DASHBOARD_AUTH_RECONCILE_INTERVAL_SECONDS:
+            if (
+                self._auth_reconcile_inflight
+                or now - self._last_auth_reconcile_at
+                < DASHBOARD_AUTH_RECONCILE_INTERVAL_SECONDS
+            ):
                 return 0
             self._last_auth_reconcile_at = now
+            self._auth_reconcile_inflight = True
+        try:
+            threading.Thread(
+                target=self._reconcile_dashboard_auth_background,
+                name="dashboard-auth-reconcile",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            with self._auth_reconcile_lock:
+                self._auth_reconcile_inflight = False
+            LOG.warning("dashboard auth reconciliation scheduling failed: %s", type(exc).__name__)
+        return 0
+
+    def _refresh_dashboard_cache(self) -> None:
+        """Render one dashboard snapshot and publish it atomically."""
+
+        with self._dashboard_render_lock:
             try:
-                rebound = self.repo.reconcile_auth_identities(self.resolver)
+                marker = self.repo.dashboard_cache_marker()
+                body = dashboard_html(
+                    self.repo,
+                    self.queue_poller.status(),
+                    self.quota_poller.status(),
+                    self.codex_app_importer.status(),
+                    self.resolver,
+                    self.cockpit_tools_status(),
+                    self.sub2api_status(),
+                ).encode("utf-8")
+                marker = self.repo.dashboard_cache_marker()
+                with self._dashboard_cache_lock:
+                    self._dashboard_cache_body = body
+                    self._dashboard_cache_marker = marker
+                    self._dashboard_cache_at = time.monotonic()
             except Exception as exc:
-                LOG.warning("dashboard auth reconciliation failed: %s", type(exc).__name__)
-                return 0
-        if rebound:
-            LOG.info("reconciled %d provisional auth identity event(s)", rebound)
-            self.invalidate_dashboard_cache()
-        return rebound
+                LOG.error("dashboard cache refresh failed: %s", type(exc).__name__)
+            finally:
+                with self._dashboard_cache_lock:
+                    self._dashboard_refresh_inflight = False
+
+    def _start_dashboard_cache_refresh(self) -> None:
+        with self._dashboard_cache_lock:
+            if self._dashboard_refresh_inflight:
+                return
+            self._dashboard_refresh_inflight = True
+        try:
+            threading.Thread(
+                target=self._refresh_dashboard_cache,
+                name="dashboard-cache-refresh",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            with self._dashboard_cache_lock:
+                self._dashboard_refresh_inflight = False
+            LOG.warning("dashboard cache refresh scheduling failed: %s", type(exc).__name__)
 
     def render_dashboard_body(self, *, force: bool = False) -> bytes:
-        """Return a cached dashboard or render one synchronized snapshot."""
+        """Return a cached dashboard and refresh stale data in the background."""
 
         marker = self.repo.dashboard_cache_marker()
         now = time.monotonic()
         with self._dashboard_cache_lock:
-            if (
-                not force
-                and self._dashboard_cache_body is not None
+            body = self._dashboard_cache_body
+            fresh = (
+                body is not None
                 and self._dashboard_cache_marker == marker
                 and now - self._dashboard_cache_at < DASHBOARD_CACHE_TTL_SECONDS
-            ):
-                return self._dashboard_cache_body
-
-        # Multiple browser tabs can arrive together after login.  Only one of
-        # them should pay the render cost; the others wait for the same bytes.
-        with self._dashboard_render_lock:
-            marker = self.repo.dashboard_cache_marker()
-            now = time.monotonic()
-            with self._dashboard_cache_lock:
-                if (
-                    not force
-                    and self._dashboard_cache_body is not None
-                    and self._dashboard_cache_marker == marker
-                    and now - self._dashboard_cache_at < DASHBOARD_CACHE_TTL_SECONDS
-                ):
-                    return self._dashboard_cache_body
-
-            body = dashboard_html(
-                self.repo,
-                self.queue_poller.status(),
-                self.quota_poller.status(),
-                self.codex_app_importer.status(),
-                self.resolver,
-                self.cockpit_tools_status(),
-                self.sub2api_status(),
-            ).encode("utf-8")
-            with self._dashboard_cache_lock:
-                self._dashboard_cache_body = body
-                self._dashboard_cache_marker = marker
-                self._dashboard_cache_at = time.monotonic()
+            )
+        if not force and body is not None:
+            if not fresh:
+                # Serve the last complete snapshot immediately.  The next
+                # request will observe the refreshed marker after this worker
+                # publishes a new render.
+                self._start_dashboard_cache_refresh()
             return body
+
+        # A first render has no stale snapshot to serve.  Startup prewarming
+        # uses this synchronous path; later failures leave the prior snapshot
+        # intact for the stale-while-revalidate path above.
+        with self._dashboard_cache_lock:
+            self._dashboard_refresh_inflight = True
+        self._refresh_dashboard_cache()
+        with self._dashboard_cache_lock:
+            return self._dashboard_cache_body or b""
 
     def warm_dashboard_cache(self) -> None:
         """Build the first page before background collectors begin polling."""
