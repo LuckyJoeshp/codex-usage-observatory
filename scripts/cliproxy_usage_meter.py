@@ -12549,7 +12549,10 @@ class MeterHTTPServer(ThreadingHTTPServer):
             self._dashboard_refresh_inflight = True
         self._refresh_dashboard_cache()
         with self._dashboard_cache_lock:
-            return self._dashboard_cache_body or b""
+            body = self._dashboard_cache_body
+        if body is None:
+            raise RuntimeError("dashboard cache unavailable")
+        return body
 
     def warm_dashboard_cache(self) -> None:
         """Build the first page before background collectors begin polling."""
