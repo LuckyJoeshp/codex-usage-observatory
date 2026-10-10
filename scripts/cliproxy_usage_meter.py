@@ -101,6 +101,8 @@ DEFAULT_SUB2API_BACKFILL_DAYS = 30
 MAX_SUB2API_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SUB2API_PAGES = 10_000
 IMPORTED_EVENT_SYNC_BATCH_SIZE = 500
+DASHBOARD_CACHE_TTL_SECONDS = 120.0
+DASHBOARD_AUTH_RECONCILE_INTERVAL_SECONDS = 300.0
 SUB2API_REQUEST_SOURCE = "sub2api"
 SUB2API_QUOTA_SOURCE = "sub2api_quota"
 SUB2API_ACCOUNT_SOURCE = "sub2api_account"
@@ -6524,6 +6526,39 @@ class UsageRepository:
             ).fetchone()
         return dict(row)
 
+    def dashboard_cache_marker(self) -> tuple[Any, ...]:
+        """Return cheap high-water marks for the rendered dashboard cache.
+
+        The page contains several all-time aggregates, but most of that history
+        is immutable after collection.  Checking these indexed high-water marks
+        lets the HTTP server reuse the rendered page without rescanning the
+        historical tables on every browser request.  A short TTL still covers
+        in-place corrections to an existing imported row whose id does not
+        change.
+        """
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  COALESCE((SELECT MAX(id) FROM usage_events), 0) AS usage_events,
+                  COALESCE((SELECT MAX(id) FROM subscription_quota_snapshots), 0)
+                    AS quota_snapshots,
+                  COALESCE((SELECT MAX(id) FROM quota_events), 0) AS quota_events,
+                  COALESCE((SELECT MAX(id) FROM account_quota_cycles), 0)
+                    AS quota_cycles,
+                  COALESCE((SELECT MAX(rowid) FROM api_response_observations), 0)
+                    AS response_observations,
+                  COALESCE((SELECT MAX(rowid) FROM anonymous_usage_daily), 0)
+                    AS anonymous_daily,
+                  COALESCE((SELECT MAX(updated_at) FROM model_prices), '')
+                    AS model_prices,
+                  COALESCE((SELECT MAX(updated_at) FROM price_sync_metadata), '')
+                    AS price_sync
+                """
+            ).fetchone()
+        return tuple(row)
+
     def response_timeline(
         self,
         minutes: int = DEFAULT_RESPONSE_TIMELINE_MINUTES,
@@ -12333,6 +12368,16 @@ class MeterHTTPServer(ThreadingHTTPServer):
             backfill_days=sub2api_backfill_days,
         )
         self.sub2api_import_enabled = bool(sub2api_import_enabled)
+        # The dashboard is a read-mostly view over a settled history.  Keep
+        # its rendered bytes in memory so opening or refreshing the page does
+        # not rerun every all-time aggregation while collectors are idle.
+        self._dashboard_cache_lock = threading.Lock()
+        self._dashboard_render_lock = threading.Lock()
+        self._dashboard_cache_body: bytes | None = None
+        self._dashboard_cache_marker: tuple[Any, ...] | None = None
+        self._dashboard_cache_at = 0.0
+        self._auth_reconcile_lock = threading.Lock()
+        self._last_auth_reconcile_at = 0.0
 
     def cockpit_tools_status(self) -> dict[str, Any]:
         if self.cockpit_tools_import_enabled:
@@ -12378,6 +12423,89 @@ class MeterHTTPServer(ThreadingHTTPServer):
             "last_quota_rows": 0,
             **self.repo.import_status(SUB2API_REQUEST_SOURCE),
         }
+
+    def invalidate_dashboard_cache(self) -> None:
+        """Discard the rendered page after a known identity migration."""
+
+        with self._dashboard_cache_lock:
+            self._dashboard_cache_body = None
+            self._dashboard_cache_marker = None
+            self._dashboard_cache_at = 0.0
+
+    def _maybe_reconcile_dashboard_auth(self) -> int:
+        """Run the expensive identity pass only for an active usage queue.
+
+        Collector-only mode already reconciles once during startup and the
+        local importers apply their own privacy migrations.  Repeating the
+        full-table transaction for every page request only adds SQLite lock
+        contention.  When the optional management queue is enabled, retain the
+        safety net but cap it at one pass per interval.
+        """
+
+        if not self.queue_poller.status().get("enabled"):
+            return 0
+        now = time.monotonic()
+        with self._auth_reconcile_lock:
+            if now - self._last_auth_reconcile_at < DASHBOARD_AUTH_RECONCILE_INTERVAL_SECONDS:
+                return 0
+            self._last_auth_reconcile_at = now
+            try:
+                rebound = self.repo.reconcile_auth_identities(self.resolver)
+            except Exception as exc:
+                LOG.warning("dashboard auth reconciliation failed: %s", type(exc).__name__)
+                return 0
+        if rebound:
+            LOG.info("reconciled %d provisional auth identity event(s)", rebound)
+            self.invalidate_dashboard_cache()
+        return rebound
+
+    def render_dashboard_body(self, *, force: bool = False) -> bytes:
+        """Return a cached dashboard or render one synchronized snapshot."""
+
+        marker = self.repo.dashboard_cache_marker()
+        now = time.monotonic()
+        with self._dashboard_cache_lock:
+            if (
+                not force
+                and self._dashboard_cache_body is not None
+                and self._dashboard_cache_marker == marker
+                and now - self._dashboard_cache_at < DASHBOARD_CACHE_TTL_SECONDS
+            ):
+                return self._dashboard_cache_body
+
+        # Multiple browser tabs can arrive together after login.  Only one of
+        # them should pay the render cost; the others wait for the same bytes.
+        with self._dashboard_render_lock:
+            marker = self.repo.dashboard_cache_marker()
+            now = time.monotonic()
+            with self._dashboard_cache_lock:
+                if (
+                    not force
+                    and self._dashboard_cache_body is not None
+                    and self._dashboard_cache_marker == marker
+                    and now - self._dashboard_cache_at < DASHBOARD_CACHE_TTL_SECONDS
+                ):
+                    return self._dashboard_cache_body
+
+            body = dashboard_html(
+                self.repo,
+                self.queue_poller.status(),
+                self.quota_poller.status(),
+                self.codex_app_importer.status(),
+                self.resolver,
+                self.cockpit_tools_status(),
+                self.sub2api_status(),
+            ).encode("utf-8")
+            with self._dashboard_cache_lock:
+                self._dashboard_cache_body = body
+                self._dashboard_cache_marker = marker
+                self._dashboard_cache_at = time.monotonic()
+            return body
+
+    def warm_dashboard_cache(self) -> None:
+        """Build the first page before background collectors begin polling."""
+
+        self.render_dashboard_body(force=True)
 
     def start_queue_poller(self) -> None:
         self.queue_poller.start()
@@ -12449,18 +12577,8 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 self._plain_response(405, b"method not allowed\n")
                 return
             try:
-                rebound = self.meter_server.repo.reconcile_auth_identities(self.meter_server.resolver)
-                if rebound:
-                    LOG.info("reconciled %d provisional auth identity event(s)", rebound)
-                body = dashboard_html(
-                    self.meter_server.repo,
-                    self.meter_server.queue_poller.status(),
-                    self.meter_server.quota_poller.status(),
-                    self.meter_server.codex_app_importer.status(),
-                    self.meter_server.resolver,
-                    self.meter_server.cockpit_tools_status(),
-                    self.meter_server.sub2api_status(),
-                ).encode("utf-8")
+                self.meter_server._maybe_reconcile_dashboard_auth()
+                body = self.meter_server.render_dashboard_body()
             except Exception as exc:  # dashboard failure must not expose DB internals
                 LOG.error("dashboard rendering failed: %s", type(exc).__name__)
                 self._plain_response(500, b"dashboard unavailable\n")
@@ -13471,6 +13589,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.upstream,
             repo.path,
         )
+        try:
+            server.warm_dashboard_cache()
+            LOG.info("dashboard cache warmed before collectors started")
+        except Exception as exc:
+            # A dashboard prewarm must never prevent the service from coming
+            # up; the first request will retry the same render path.
+            LOG.warning("dashboard cache prewarm failed: %s", type(exc).__name__)
         if args.quota_routing_guard and not args.no_usage_queue:
             LOG.info(
                 "confirmed quota routing guard enabled; provider percentage alone never locks a credential"
