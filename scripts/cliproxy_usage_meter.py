@@ -6903,6 +6903,34 @@ class UsageRepository:
                 conn, values["identity_key"]
             ):
                 return False
+            existing = conn.execute(
+                """SELECT provider_allowed, provider_limit_reached
+                     FROM subscription_quota_snapshots
+                    WHERE identity_key=:identity_key
+                      AND window_kind=:window_kind
+                      AND fetched_at=:fetched_at""",
+                values,
+            ).fetchone()
+            if existing is not None:
+                # Even an ignored INSERT advances SQLite's AUTOINCREMENT
+                # sequence. Avoid that write for every repeated poll.
+                if any(
+                    values[field] is not None and existing[field] != values[field]
+                    for field in ("provider_allowed", "provider_limit_reached")
+                ):
+                    # Older snapshots can lack these newly allowlisted gates.
+                    conn.execute(
+                        """UPDATE subscription_quota_snapshots
+                              SET provider_allowed=
+                                    COALESCE(:provider_allowed, provider_allowed),
+                                  provider_limit_reached=
+                                    COALESCE(:provider_limit_reached, provider_limit_reached)
+                            WHERE identity_key=:identity_key
+                              AND window_kind=:window_kind
+                              AND fetched_at=:fetched_at""",
+                        values,
+                    )
+                return False
             # Sparse management/JWT responses can omit either field
             # independently.  Look up each value independently as well: a
             # newer plan-only row must not hide an older, still valid renewal
@@ -6940,30 +6968,8 @@ class UsageRepository:
                 values,
             )
             inserted = max(int(cursor.rowcount), 0) > 0
-            if not inserted and (
-                values["provider_allowed"] is not None
-                or values["provider_limit_reached"] is not None
-            ):
-                # A meter upgraded in place may already have this exact
-                # snapshot under the unique key, but without the newly
-                # allowlisted provider gate booleans.  Fill those fields
-                # without fabricating a second quota observation.
-                conn.execute(
-                    """UPDATE subscription_quota_snapshots
-                          SET provider_allowed=
-                                CASE WHEN :provider_allowed IS NULL
-                                     THEN provider_allowed
-                                     ELSE :provider_allowed END,
-                              provider_limit_reached=
-                                CASE WHEN :provider_limit_reached IS NULL
-                                     THEN provider_limit_reached
-                                     ELSE :provider_limit_reached END
-                        WHERE identity_key=:identity_key
-                          AND window_kind=:window_kind
-                          AND fetched_at=:fetched_at""",
-                    values,
-                )
-            self._compact_quota_snapshots_conn(conn, values["identity_key"])
+            if inserted:
+                self._compact_quota_snapshots_conn(conn, values["identity_key"])
             return inserted
 
     def latest_subscription_quotas(self) -> list[dict[str, Any]]:

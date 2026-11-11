@@ -59,6 +59,34 @@ class UsageStorageTest(unittest.TestCase):
                 "SELECT * FROM subscription_quota_snapshots ORDER BY id"
             )]
 
+    def test_duplicate_snapshot_does_not_write_or_recompact(self):
+        snapshot = self.snapshot(provider_allowed=True, provider_limit_reached=False)
+        self.assertTrue(self.repo.insert_subscription_quota_snapshot(snapshot))
+        with self.repo.connect() as observer:
+            before = observer.execute("PRAGMA data_version").fetchone()[0]
+            with mock.patch.object(
+                self.repo, "_compact_quota_snapshots_conn",
+                side_effect=AssertionError("duplicate snapshot compacted"),
+            ):
+                self.assertFalse(self.repo.insert_subscription_quota_snapshot(snapshot))
+            after = observer.execute("PRAGMA data_version").fetchone()[0]
+        self.assertEqual(before, after)
+        self.assertEqual(len(self.snapshots()), 1)
+
+    def test_duplicate_snapshot_still_backfills_provider_gates(self):
+        self.repo.insert_subscription_quota_snapshot(
+            self.snapshot(provider_allowed=None, provider_limit_reached=None)
+        )
+        with mock.patch.object(
+            self.repo, "_compact_quota_snapshots_conn",
+            side_effect=AssertionError("metadata backfill compacted"),
+        ):
+            self.assertFalse(self.repo.insert_subscription_quota_snapshot(
+                self.snapshot(provider_allowed=True, provider_limit_reached=False)
+            ))
+        row = self.snapshots()[0]
+        self.assertEqual((row["provider_allowed"], row["provider_limit_reached"]), (1, 0))
+
     def test_new_polls_keep_latest_status_and_each_reset_despite_backfill_order(self):
         for key in (ALPHA, BETA):
             for minute in range(20):
