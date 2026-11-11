@@ -602,6 +602,12 @@ class Sub2APIImporterTest(unittest.TestCase):
         self.assertEqual(unchanged["quota_rows"], 0)
         self.assertEqual(table_dml(statements, "subscription_quota_snapshots"), [])
 
+        with mock.patch.object(
+            self.repo, "latest_subscription_quotas",
+            side_effect=AssertionError("account poll scanned every quota row"),
+        ):
+            self.assertEqual(self.importer._import_account_snapshots(self.fake.accounts), 0)
+
         account["status"] = "error"
         account["schedulable"] = False
         changed = self.importer.import_once()

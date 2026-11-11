@@ -87,6 +87,43 @@ class UsageStorageTest(unittest.TestCase):
         row = self.snapshots()[0]
         self.assertEqual((row["provider_allowed"], row["provider_limit_reached"]), (1, 0))
 
+    def test_discarded_older_poll_does_not_reinsert_after_compaction(self):
+        self.repo.insert_subscription_quota_snapshot(self.snapshot(
+            fetched_at="2026-10-06T12:00:00Z", used_percent=20,
+        ))
+        older = self.snapshot(fetched_at="2026-10-06T11:30:00Z", used_percent=10)
+        with self.repo.connect() as conn:
+            before = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='subscription_quota_snapshots'"
+            ).fetchone()[0]
+        with mock.patch.object(
+            self.repo, "_compact_quota_snapshots_conn",
+            side_effect=AssertionError("discarded poll compacted"),
+        ):
+            self.assertFalse(self.repo.insert_subscription_quota_snapshot(older))
+        with self.repo.connect() as conn:
+            after = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='subscription_quota_snapshots'"
+            ).fetchone()[0]
+        self.assertEqual(before, after)
+        self.assertEqual(len(self.snapshots()), 1)
+
+        # A different reset is a prior window that the dashboard still uses.
+        self.assertTrue(self.repo.insert_subscription_quota_snapshot(
+            {**older, "reset_at": "2026-10-05T00:00:00Z"}
+        ))
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_older_poll_can_supply_missing_plan_metadata(self):
+        self.repo.insert_subscription_quota_snapshot(self.snapshot(
+            fetched_at="2026-10-06T12:00:00Z",
+        ))
+        self.assertTrue(self.repo.insert_subscription_quota_snapshot(self.snapshot(
+            fetched_at="2026-10-06T11:30:00Z", plan_type="team",
+        )))
+        self.assertEqual(len(self.snapshots()), 2)
+        self.assertIn("team", [row["plan_type"] for row in self.snapshots()])
+
     def test_new_polls_keep_latest_status_and_each_reset_despite_backfill_order(self):
         for key in (ALPHA, BETA):
             for minute in range(20):

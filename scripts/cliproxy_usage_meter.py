@@ -6931,6 +6931,31 @@ class UsageRepository:
                         values,
                     )
                 return False
+            # An older observation from a repeatedly returned provider response
+            # is discarded by compaction when a newer row for the same reset
+            # already exists.  Skip it before metadata lookups and INSERT so
+            # every poll does not rescan history or rewrite quota pages.
+            newer_period = conn.execute(
+                """SELECT 1 FROM subscription_quota_snapshots
+                    WHERE identity_key=:identity_key
+                      AND window_kind=:window_kind
+                      AND reset_at IS :reset_at
+                      AND fetched_at>:fetched_at LIMIT 1""",
+                values,
+            ).fetchone()
+            if newer_period is not None:
+                metadata_anchor_needed = any(
+                    values[field] is not None
+                    and conn.execute(
+                        f"""SELECT 1 FROM subscription_quota_snapshots
+                             WHERE identity_key=? AND {field} IS NOT NULL
+                               AND fetched_at>? LIMIT 1""",
+                        (values["identity_key"], values["fetched_at"]),
+                    ).fetchone() is None
+                    for field in ("plan_type", "subscription_active_until")
+                )
+                if not metadata_anchor_needed:
+                    return False
             # Sparse management/JWT responses can omit either field
             # independently.  Look up each value independently as well: a
             # newer plan-only row must not hide an older, still valid renewal
@@ -7017,6 +7042,24 @@ class UsageRepository:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_account_statuses(
+        self, identity_keys: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Read current provider status for the supplied accounts only."""
+
+        result: dict[str, dict[str, Any]] = {}
+        with self.connect() as conn:
+            for identity_key in set(identity_keys):
+                row = conn.execute(
+                    """SELECT * FROM subscription_quota_snapshots
+                        WHERE identity_key=? AND window_kind='account_status'
+                        ORDER BY fetched_at DESC, id DESC LIMIT 1""",
+                    (identity_key,),
+                ).fetchone()
+                if row is not None:
+                    result[identity_key] = dict(row)
+        return result
 
     def subscription_dashboard_rows(self) -> list[dict[str, Any]]:
         quotas = self.latest_subscription_quotas()
@@ -9474,13 +9517,16 @@ class Sub2APIImporter:
     ) -> int:
         inserted = 0
         now = utc_now()
-        previous_statuses = {
-            str(row.get("identity_key")): row
-            for row in self.repo.latest_subscription_quotas()
-            if row.get("window_kind") == "account_status"
-        }
-        for account in accounts:
-            identity = self.resolver.resolve_sub2api_account(account.get("id"))
+        resolved_accounts = [
+            (account, self.resolver.resolve_sub2api_account(account.get("id")))
+            for account in accounts
+        ]
+        previous_statuses = self.repo.latest_account_statuses(
+            f"subscription:{identity.subscription_id_hash}"
+            for _, identity in resolved_accounts
+            if identity.subscription_id_hash
+        )
+        for account, identity in resolved_accounts:
             if not identity.subscription_id_hash:
                 continue
             identity_key_value = f"subscription:{identity.subscription_id_hash}"
