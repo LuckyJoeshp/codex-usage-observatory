@@ -6527,15 +6527,7 @@ class UsageRepository:
         return dict(row)
 
     def dashboard_cache_marker(self) -> tuple[Any, ...]:
-        """Return cheap high-water marks for the rendered dashboard cache.
-
-        The page contains several all-time aggregates, but most of that history
-        is immutable after collection.  Checking these indexed high-water marks
-        lets the HTTP server reuse the rendered page without rescanning the
-        historical tables on every browser request.  A short TTL still covers
-        in-place corrections to an existing imported row whose id does not
-        change.
-        """
+        """Return indexed high-water marks for optional change diagnostics."""
 
         with self.connect() as conn:
             row = conn.execute(
@@ -7096,7 +7088,10 @@ class UsageRepository:
                 entry["fetched_at"] = quota.get("fetched_at")
 
         all_accounts = {row["identity_key"]: row for row in self.grouped("all", "account")}
-        quota_cycles = {row["identity_key"]: row for row in self.quota_summary("all")}
+        quota_cycles = {
+            row["identity_key"]: row
+            for row in self.quota_summary("all", known_identities=all_accounts.values())
+        }
         # Estimate from one SQLite snapshot per dashboard render.  The WHAM
         # percentage is the authoritative subscription window signal; event
         # cycles remain a fallback because transient 429s can fragment them.
@@ -7660,11 +7655,17 @@ class UsageRepository:
         weight = position - lower
         return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
-    def quota_summary(self, period: str = "30d") -> list[dict[str, Any]]:
+    def quota_summary(
+        self,
+        period: str = "30d",
+        *,
+        known_identities: Iterable[Mapping[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         start = period_start(period)
         with self.connect() as conn:
-            identities = conn.execute(
-                """
+            if known_identities is None:
+                identities = conn.execute(
+                    """
                 SELECT identity_key, MAX(usage_alias) usage_alias,
                        MAX(account_id_tail) account_id_tail,
                        MAX(account_id_hash) account_id_hash,
@@ -7688,7 +7689,15 @@ class UsageRepository:
                     )
                 GROUP BY identity_key ORDER BY MAX(ts) DESC
                 """
-            ).fetchall()
+                ).fetchall()
+            else:
+                # The dashboard already grouped its active accounts.  Reuse
+                # that small set instead of sorting all event and quota rows
+                # into a temporary SQLite file on every page render.
+                identities = [
+                    identity for identity in known_identities
+                    if identity.get("identity_key")
+                ]
             results: list[dict[str, Any]] = []
             for identity in identities:
                 key = identity["identity_key"]
@@ -12422,13 +12431,12 @@ class MeterHTTPServer(ThreadingHTTPServer):
             backfill_days=sub2api_backfill_days,
         )
         self.sub2api_import_enabled = bool(sub2api_import_enabled)
-        # The dashboard is a read-mostly view over a settled history.  Keep
-        # its rendered bytes in memory so opening or refreshing the page does
-        # not rerun every all-time aggregation while collectors are idle.
+        # Rendering scans all-time history.  Keep a snapshot for the full
+        # refresh interval even as new events arrive, so a browser's 30-second
+        # reload cannot repeatedly rescan the database.
         self._dashboard_cache_lock = threading.Lock()
         self._dashboard_render_lock = threading.Lock()
         self._dashboard_cache_body: bytes | None = None
-        self._dashboard_cache_marker: tuple[Any, ...] | None = None
         self._dashboard_cache_at = 0.0
         self._dashboard_refresh_inflight = False
         self._auth_reconcile_lock = threading.Lock()
@@ -12484,7 +12492,6 @@ class MeterHTTPServer(ThreadingHTTPServer):
         """Discard the rendered page after a known identity migration."""
 
         with self._dashboard_cache_lock:
-            self._dashboard_cache_marker = None
             self._dashboard_cache_at = 0.0
 
     def _reconcile_dashboard_auth_background(self) -> None:
@@ -12539,7 +12546,6 @@ class MeterHTTPServer(ThreadingHTTPServer):
 
         with self._dashboard_render_lock:
             try:
-                marker = self.repo.dashboard_cache_marker()
                 body = dashboard_html(
                     self.repo,
                     self.queue_poller.status(),
@@ -12549,10 +12555,8 @@ class MeterHTTPServer(ThreadingHTTPServer):
                     self.cockpit_tools_status(),
                     self.sub2api_status(),
                 ).encode("utf-8")
-                marker = self.repo.dashboard_cache_marker()
                 with self._dashboard_cache_lock:
                     self._dashboard_cache_body = body
-                    self._dashboard_cache_marker = marker
                     self._dashboard_cache_at = time.monotonic()
             except Exception as exc:
                 LOG.error("dashboard cache refresh failed: %s", type(exc).__name__)
@@ -12579,19 +12583,17 @@ class MeterHTTPServer(ThreadingHTTPServer):
     def render_dashboard_body(self, *, force: bool = False) -> bytes:
         """Return a cached dashboard and refresh stale data in the background."""
 
-        marker = self.repo.dashboard_cache_marker()
         now = time.monotonic()
         with self._dashboard_cache_lock:
             body = self._dashboard_cache_body
             fresh = (
                 body is not None
-                and self._dashboard_cache_marker == marker
                 and now - self._dashboard_cache_at < DASHBOARD_CACHE_TTL_SECONDS
             )
         if not force and body is not None:
             if not fresh:
                 # Serve the last complete snapshot immediately.  The next
-                # request will observe the refreshed marker after this worker
+                # request will observe the refreshed page after this worker
                 # publishes a new render.
                 self._start_dashboard_cache_refresh()
             return body

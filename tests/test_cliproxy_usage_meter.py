@@ -1613,6 +1613,31 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(events, ["usage_limit_hit", "reset_detected"])
         summary = self.sidecar.repo.quota_summary("30d")[0]
         self.assertEqual(summary["currently_quota_hit"], 0)
+        known = self.sidecar.repo.grouped("all", "account")
+        targeted = self.sidecar.repo.quota_summary("30d", known_identities=known)[0]
+        self.assertEqual(
+            (
+                targeted["current_cycle_observed_floor_usd"],
+                targeted["last_complete_cycle_api_equivalent_quota_usd"],
+            ),
+            (
+                summary["current_cycle_observed_floor_usd"],
+                summary["last_complete_cycle_api_equivalent_quota_usd"],
+            ),
+        )
+
+    def test_dashboard_cache_limits_full_refresh_to_two_minutes(self) -> None:
+        self.sidecar._dashboard_cache_body = b"cached dashboard"
+        self.sidecar._dashboard_cache_at = 1000.0
+        with mock.patch.object(
+            self.sidecar, "_start_dashboard_cache_refresh"
+        ) as refresh:
+            with mock.patch.object(meter.time, "monotonic", return_value=1059.0):
+                self.assertEqual(self.sidecar.render_dashboard_body(), b"cached dashboard")
+            refresh.assert_not_called()
+            with mock.patch.object(meter.time, "monotonic", return_value=1120.0):
+                self.assertEqual(self.sidecar.render_dashboard_body(), b"cached dashboard")
+            refresh.assert_called_once_with()
 
     def test_success_after_quota_does_not_reset_while_provider_window_is_full(self) -> None:
         self.request("POST", "/v1/fail", {"model": "fake-error"})
