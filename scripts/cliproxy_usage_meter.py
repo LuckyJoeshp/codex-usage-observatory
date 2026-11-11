@@ -8690,6 +8690,9 @@ class CockpitToolsImporter:
             "suspect": 0,
             "retired": 0,
         }
+        self._request_log_signature: tuple[int, ...] | None = None
+        self._request_log_max_id: int | None = None
+        self._request_log_max_version: int | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -8749,6 +8752,32 @@ class CockpitToolsImporter:
                 self._database_available = self.database_path.is_file()
                 LOG.warning("Cockpit Tools import failed: %s", type(exc).__name__)
             self._stop.wait(self.poll_seconds)
+
+    def _request_log_file_signature(self) -> tuple[int, ...] | None:
+        """Detect in-place repricing, including uncheckpointed WAL writes."""
+
+        try:
+            main = self.database_path.stat()
+            try:
+                wal = Path(f"{self.database_path}-wal").stat()
+            except FileNotFoundError:
+                wal = None
+        except OSError:
+            return None
+        # Empty WAL files can be recreated by readers without changing data.
+        wal_signature = (
+            (wal.st_ino, wal.st_size, wal.st_mtime_ns)
+            if wal is not None and wal.st_size
+            else (0, 0, 0)
+        )
+        return (main.st_ino, main.st_size, main.st_mtime_ns, *wal_signature)
+
+    @staticmethod
+    def _read_max_pricing_version(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(model_pricing_version), 0) FROM request_logs"
+        ).fetchone()
+        return as_nonnegative_int(row[0]) or 0
 
     @staticmethod
     def _safe_rate(value: Any) -> float | None:
@@ -9054,13 +9083,25 @@ class CockpitToolsImporter:
             missing = set(self.REQUIRED_REQUEST_COLUMNS) - available_columns
             if missing:
                 raise ValueError("cockpit_request_logs_schema")
-            maxima = connection.execute(
-                """SELECT COALESCE(MAX(id), 0) AS max_id,
-                          COALESCE(MAX(model_pricing_version), 0) AS max_version
-                     FROM request_logs"""
-            ).fetchone()
-            max_id = as_nonnegative_int(maxima["max_id"]) or 0
-            max_version = as_nonnegative_int(maxima["max_version"]) or 0
+            # MAX(id) uses the primary-key index.  MAX(model_pricing_version)
+            # scans the entire external request table, so repeat that scan
+            # only when the database or its nonempty WAL has changed.
+            max_id = as_nonnegative_int(connection.execute(
+                "SELECT MAX(id) FROM request_logs"
+            ).fetchone()[0]) or 0
+            signature = self._request_log_file_signature()
+            if (
+                signature is not None
+                and signature == self._request_log_signature
+                and max_id == self._request_log_max_id
+                and self._request_log_max_version is not None
+            ):
+                max_version = self._request_log_max_version
+            else:
+                max_version = self._read_max_pricing_version(connection)
+                self._request_log_signature = signature
+                self._request_log_max_id = max_id
+                self._request_log_max_version = max_version
             state = self.repo.local_import_file_state(self.database_path) or {}
             cursor_id = as_nonnegative_int(state.get("offset")) or 0
             previous_version = as_nonnegative_int(state.get("size")) or 0

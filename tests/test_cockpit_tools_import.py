@@ -538,25 +538,38 @@ class CockpitToolsImporterTest(unittest.TestCase):
 
     def test_incremental_import_is_idempotent_and_reprices_in_place(self) -> None:
         self._insert_request("event-one", 1_786_665_600)
-        self.assertEqual(self.importer.import_once()["imported"], 1)
-        self.assertEqual(self.importer.import_once()["scanned"], 0)
-        self._insert_request("event-two", 1_786_665_601_000)
-        appended = self.importer.import_once()
-        self.assertEqual((appended["imported"], appended["scanned"]), (1, 1))
-        self.assertEqual(len(self._usage_rows()), 2)
+        with patch.object(
+            self.importer,
+            "_read_max_pricing_version",
+            wraps=self.importer._read_max_pricing_version,
+        ) as full_scan:
+            self.assertEqual(self.importer.import_once()["imported"], 1)
+            self.assertEqual(self.importer.import_once()["scanned"], 0)
+            self.assertEqual(full_scan.call_count, 1)
+            self._insert_request("event-two", 1_786_665_601_000)
+            appended = self.importer.import_once()
+            self.assertEqual((appended["imported"], appended["scanned"]), (1, 1))
+            self.assertEqual(full_scan.call_count, 2)
+            self.assertEqual(len(self._usage_rows()), 2)
 
-        with sqlite3.connect(
-            self.data_dir / meter.COCKPIT_TOOLS_LOG_DB_NAME
-        ) as connection:
-            connection.execute(
-                """UPDATE request_logs
-                      SET model_pricing_version=2,
-                          input_usd_per_million=4,
-                          cached_input_usd_per_million=0.4,
-                          output_usd_per_million=20,
-                          estimated_cost_usd=0.00528"""
+            connection = sqlite3.connect(
+                self.data_dir / meter.COCKPIT_TOOLS_LOG_DB_NAME
             )
-        repriced = self.importer.import_once()
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                with connection:
+                    connection.execute(
+                        """UPDATE request_logs
+                              SET model_pricing_version=2,
+                                  input_usd_per_million=4,
+                                  cached_input_usd_per_million=0.4,
+                                  output_usd_per_million=20,
+                                  estimated_cost_usd=0.00528"""
+                    )
+                repriced = self.importer.import_once()
+                self.assertEqual(full_scan.call_count, 3)
+            finally:
+                connection.close()
         self.assertEqual((repriced["imported"], repriced["scanned"]), (0, 2))
         rows = self._usage_rows()
         self.assertEqual(len(rows), 2)
