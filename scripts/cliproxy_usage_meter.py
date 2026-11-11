@@ -9525,8 +9525,10 @@ class Sub2APIImporter:
             status_changed = previous is None or any(
                 (
                     previous.get("estimate_method") != status_method,
-                    previous.get("plan_type") != plan_type,
-                    previous.get("subscription_active_until") != active_until,
+                    plan_type is not None
+                    and previous.get("plan_type") != plan_type,
+                    active_until is not None
+                    and previous.get("subscription_active_until") != active_until,
                     previous.get("provider_allowed")
                     != (None if available is None else int(available)),
                     previous.get("provider_limit_reached")

@@ -590,6 +590,33 @@ class Sub2APIImporterTest(unittest.TestCase):
             self.assertEqual(state["estimate_method"], "sub2api_error")
             self.assertEqual(state["provider_allowed"], 0)
 
+    def test_missing_optional_account_fields_do_not_churn_status_rows(self) -> None:
+        self.importer.import_once()
+        account = self.fake.accounts[0]
+        account["extra"].pop("plan_type")
+        account.pop("expires_at")
+
+        self.repo.start_trace()
+        unchanged = self.importer.import_once()
+        statements = self.repo.stop_trace()
+        self.assertEqual(unchanged["quota_rows"], 0)
+        self.assertEqual(table_dml(statements, "subscription_quota_snapshots"), [])
+
+        account["status"] = "error"
+        account["schedulable"] = False
+        changed = self.importer.import_once()
+        self.assertEqual(changed["quota_rows"], 1)
+        self.assertEqual(
+            next(
+                row["estimate_method"] for row in self.repo.latest_subscription_quotas()
+                if row["window_kind"] == "account_status"
+                and row["identity_key"] == meter.resolved_identity_key(
+                    self.resolver.resolve_sub2api_account(ACCOUNT_SELECTOR)
+                )
+            ),
+            "sub2api_error",
+        )
+
     def test_identical_14k_overlap_has_no_usage_or_observation_dml(self) -> None:
         count = 14_000
         self.fake.usage = [
